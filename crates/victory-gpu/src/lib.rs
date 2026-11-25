@@ -23,6 +23,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;

@@ -134,6 +134,10 @@ Speed and memory:
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+
+`VICTORY_AMBIENT` sets the constant indirect diffuse light after screen-probe
+resolve (default `0.6`). Use `off` to preserve the game's probe output during
+ray-tracing tests, or `0` for black indirect light.
 Each is described in a comment where it is read.
 
 ### Known problems
