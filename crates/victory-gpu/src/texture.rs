@@ -694,12 +694,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now_at(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_at(start, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -718,7 +718,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = hashed(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -739,7 +739,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = hashed(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -756,7 +756,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = hashed(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -782,7 +782,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = hashed(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -801,6 +801,19 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.detile_untimed(tiled);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::TexDetileUs, started.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::TexDetiles, 1);
+            crate::copystat::texture_detiled(self.memory as usize, tiled.len(), &self.layout.desc);
+        }
+    }
+
+    /// [`Staging::detile`] without the diagnostics' timing.
+    fn detile_untimed(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -828,6 +841,16 @@ impl Staging {
             }
         }
     }
+}
+
+/// The hash of a texture's memory (diagnostics: timed, `TexHashUs`).
+fn hashed(bytes: &[u8]) -> blake3::Hash {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let hash = blake3::hash(bytes);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::TexHashUs, started.elapsed().as_micros() as u64);
+    hash
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an

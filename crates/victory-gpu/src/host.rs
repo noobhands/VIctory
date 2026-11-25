@@ -5738,6 +5738,19 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            let [remaps, waited, held, booked, guarded] =
+                [0, 1, 2, 3, 4].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [aliased, alias_views] =
+                [0, 1].map(|i| crate::watch::ALIASED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if remaps > 0.0 {
+                tracing::info!(
+                    "title memory remapped per frame: {remaps:.0} times, the runtime holding reads off for {:.1} ms after waiting {:.1} ms for reads under way ({:.1} ms of it in our bookkeeping, {:.1} ms of that waiting for the guards); the GPU's page-mapping copies: {aliased:.0} pages in {alias_views:.0} views",
+                    held / 1000.0,
+                    waited / 1000.0,
+                    booked / 1000.0,
+                    guarded / 1000.0
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(

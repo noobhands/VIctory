@@ -127,7 +127,13 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Texture refreshes: microseconds hashing title memory, microseconds
+    /// detiling it, and textures detiled.
+    TexHashUs,
+    TexDetileUs,
+    TexDetiles,
 }
+const _: () = assert!((C::TexDetiles as usize) < COUNTERS);
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
@@ -161,6 +167,26 @@ pub(crate) fn whole(src: usize, len: usize, us: u64) {
     let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
     e.0 += 1;
     e.1 += us;
+}
+
+/// Per texture detiled (title address, bytes): detiles since the last
+/// line, and what it is (size, format, tiling), for the textures line.
+static DETILED: Mutex<Option<HashMap<(usize, usize), (u64, String)>>> = Mutex::new(None);
+
+/// A texture of `len` bytes at title address `at`, described by `desc`,
+/// was detiled.
+pub(crate) fn texture_detiled(at: usize, len: usize, desc: &victory_formats::texture::Desc) {
+    let mut map = DETILED.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry((at, len)).or_insert_with(|| {
+        (
+            0,
+            format!(
+                "{}x{}x{} mips {} {}B/{}px {:?}",
+                desc.width, desc.height, desc.depth, desc.mips, desc.element_bytes, desc.block, desc.swizzle
+            ),
+        )
+    });
+    e.0 += 1;
 }
 
 /// The longest wait for the card since the last line: microseconds, and
@@ -1068,7 +1094,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed; texture hashing {:.1} ms, detiling {:.1} ms ({:.0} textures)",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1092,6 +1118,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        ms(c[C::TexHashUs as usize]),
+        ms(c[C::TexDetileUs as usize]),
+        c[C::TexDetiles as usize],
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
@@ -1171,6 +1200,26 @@ pub(crate) fn log(frames: f64) {
             n as f64 / frames,
             (len as u64 * n) as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
+        );
+    }
+    // The textures detiled most, by bytes: what changes every frame.
+    let detiled = DETILED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut detiled: Vec<_> = detiled.into_iter().flatten().collect();
+    detiled.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    let every = detiled.iter().filter(|(_, (n, _))| *n as f64 >= frames * 0.9).count();
+    let every_mb: f64 =
+        detiled.iter().filter(|(_, (n, _))| *n as f64 >= frames * 0.9).map(|((_, len), (n, _))| (*len as u64 * n) as f64).sum::<f64>()
+            / 1e6
+            / frames;
+    tracing::info!(
+        "  textures detiled: {} different, {every} of them nearly every frame ({every_mb:.1} MB/frame); the largest follow",
+        detiled.len()
+    );
+    for ((at, len), (n, what)) in detiled.into_iter().take(12) {
+        tracing::info!(
+            "  detiled {at:#x}+{len:#x}: {:.2}x/frame, {:.2} MB/frame, {what}",
+            n as f64 / frames,
+            (len as u64 * n) as f64 / 1e6 / frames
         );
     }
     // The waiting for the card: many short waits or a few long ones, how
