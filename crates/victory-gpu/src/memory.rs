@@ -91,7 +91,7 @@ const CHUNK: u64 = 2 << 30;
 /// `VirtualFree` and `VirtualProtect` there.
 fn in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_IN_PLACE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_IN_PLACE").is_some_and(|v| v == "1" || v == "2"))
 }
 
 /// `VICTORY_FAULTS_BY_DISPATCH=1`: each by-address dispatch of a frame
@@ -107,7 +107,7 @@ fn by_dispatch() -> bool {
 
 /// The faults' slices past the first ([`by_dispatch`]).
 fn slices() -> u32 {
-    if by_dispatch() { 2048 } else { 0 }
+    if by_dispatch() { 8192 } else { 0 }
 }
 
 /// A part of a committed section of the page pool as one buffer placed in
@@ -281,6 +281,34 @@ impl Memory {
         // the entries.
         let pages = crate::inplace::with_views(view_mapped);
         tracing::info!(regions, pages, "title memory by address: the page pool in place, through its sections' heaps");
+        // The title's private memory, committed now, in place: the same
+        // parts its root views get while such a shader is bound
+        // (`shadow::find`), so a root view and a raw address reach the same
+        // bytes. Memory committed later is opened when a shader touches it
+        // (its fault) or a root view names it.
+        let (mut parts, mut private) = (0, 0u64);
+        for shadow in crate::shadow::all_private_in_place() {
+            if self.copies.len() >= copies_limit() as usize {
+                tracing::warn!("title memory by address: no number left for private memory in place");
+                break;
+            }
+            self.copies.push(Numbered::Copy(shadow.clone()));
+            let n = self.copies.len() as u32;
+            let (first, len) = shadow.span();
+            let mut at = first.next_multiple_of(PAGE);
+            while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                // SAFETY: inside the directory's mapping; the offset first.
+                unsafe {
+                    let entry = self.directory.1.add((at / PAGE) as usize * 2);
+                    entry.add(1).write_volatile((at - first) as u32);
+                    entry.write_volatile(n);
+                }
+                at += PAGE;
+            }
+            parts += 1;
+            private += len;
+        }
+        tracing::info!(parts, mb = private >> 20, "title memory by address: the title's private memory in place");
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -379,8 +407,15 @@ impl Memory {
     /// The pages shaders found empty since the last frame: in the first
     /// slice of the faults, and with [`by_dispatch`] in each dispatch's.
     fn take_faults(&mut self) {
-        let mut pages = Vec::new();
         let used = std::mem::take(&mut self.slices);
+        self.read_faults(&used);
+    }
+
+    /// Reads (and empties) the faults of the first slice and of the slices
+    /// `used` names ([`by_dispatch`]), tracing those, and gives the pages
+    /// found their copies.
+    fn read_faults(&mut self, used: &[String]) {
+        let mut pages = Vec::new();
         // Pages in the first half of a slice, each with the native offset
         // of the access that found it empty half further on (the shader's
         // `Lower::memory`).
@@ -442,6 +477,22 @@ impl Memory {
     fn name(&mut self, address: u64, root: bool) {
         self.map(address, root);
         self.map((address & !(CELL - 1)) + CELL, false);
+    }
+}
+
+/// A submission the host waited for has run ([`by_dispatch`]): the faults
+/// its dispatches left are read now, before the frame ends (the
+/// builder's first frame is its whole first build, and the title may
+/// stop on what it built before that frame ends). The slices keep their
+/// names until the frame ends.
+pub(crate) fn after_submission() {
+    if !by_dispatch() {
+        return;
+    }
+    let Ok(mut guard) = MEMORY.try_lock() else { return };
+    if let Some(m) = guard.as_mut() {
+        let used = m.slices.clone();
+        m.read_faults(&used);
     }
 }
 

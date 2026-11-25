@@ -194,6 +194,87 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// The title's own allocations of private memory (base, bytes), as the
+/// runtime makes them (`XMemVirtualAlloc`, and the title's `VirtualAlloc`):
+/// only these are opened for the shaders that reach title memory by
+/// address, never memory of ours or the driver's.
+static ALLOCATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The title reserved or committed `[base, base + size)` (a new
+/// allocation, or pages of one).
+pub fn title_memory_allocated(base: usize, size: usize) {
+    if base == 0 || size == 0 {
+        return;
+    }
+    let mut a = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // Pages committed inside an allocation already known add nothing.
+    if a.range(..=base).next_back().is_some_and(|(&b, &s)| base + size <= b + s) {
+        return;
+    }
+    a.insert(base, size);
+    // The directory of title memory by address reaches 128 GiB
+    // (`victory_shader::emit::MEMORY_PAGES` pages of 64 KiB): an
+    // allocation past it is memory those shaders cannot reach.
+    let reach = u64::from(victory_shader::emit::MEMORY_PAGES) << 16;
+    if (base + size) as u64 > reach || size >= 256 << 20 {
+        tracing::info!(
+            base = format_args!("{base:#x}"),
+            mb = size >> 20,
+            past_the_directory = (base + size) as u64 > reach,
+            "a title allocation"
+        );
+    }
+}
+
+/// The title released the allocation at `base`.
+pub fn title_memory_released(base: usize) {
+    ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&base);
+}
+
+/// The title's allocations (base, bytes), in address order.
+pub(crate) fn title_allocations() -> Vec<(usize, usize)> {
+    ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(&b, &s)| (b, s)).collect()
+}
+
+/// The run of private, committed, read-write pages around `address`, if
+/// it is in a title allocation: (start, end), whole 64 KiB pages.
+pub(crate) fn private_run(address: usize) -> Option<(usize, usize)> {
+    let (base, size) = {
+        let a = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        a.range(..=address).next_back().map(|(&b, &s)| (b, s)).filter(|&(b, s)| address < b + s)?
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(address as *const c_void, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != mem::MEM_COMMIT || info.Type != mem::MEM_PRIVATE || info.Protect != mem::PAGE_READWRITE {
+        return None;
+    }
+    let start = (info.BaseAddress as usize).max(base).next_multiple_of(K64);
+    let end = (info.BaseAddress as usize + info.RegionSize).min(base + size) & !(K64 - 1);
+    (start <= address && address < end).then_some((start, end))
+}
+
+/// Opens `[start, start + len)` (private, committed whole, 64 KiB lines)
+/// for the shaders that reach title memory by address, counted as a title
+/// buffer in place.
+pub(crate) fn place_by_address(start: u64, len: u64) -> Option<Placed> {
+    let host = crate::host::host()?;
+    match place_part(&host.device, start, len) {
+        Ok(placed) => {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(len, Ordering::Relaxed);
+            Some(placed)
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = ?e, "title memory not opened for the shaders that reach it by address");
+            }
+            None
+        }
+    }
+}
+
 /// The bytes of `section` if the runtime made it committed (only such a
 /// section opens as a heap), else `None`.
 fn section_bytes(section: usize) -> Option<u64> {

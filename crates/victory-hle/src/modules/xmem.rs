@@ -30,7 +30,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-use crate::{HleModule, hle_export};
+use crate::{HleExport, HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
@@ -180,6 +180,23 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // The GPU side opens only the title's own memory for the shaders that
+    // reach it by address (placeholders are the page pool's, told apart).
+    if !at.is_null() && !placeholder {
+        victory_gpu::title_memory_allocated(at as usize, size);
+    }
+    at
+}
+
+/// The title's own `VirtualAlloc` (from the memory API set): Windows'
+/// own, and the allocation told to the GPU side
+/// (`victory_gpu::title_memory_allocated`).
+pub extern "system" fn title_virtual_alloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    // SAFETY: the title's own arguments.
+    let at = unsafe { VirtualAlloc(address, size, kind, protect) };
+    if !at.is_null() {
+        victory_gpu::title_memory_allocated(at as usize, size);
     }
     at
 }
@@ -1041,10 +1058,58 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own `VirtualFree` (imported from the memory API set, not
+/// from `xmem.dll`). The GPU side is told first
+/// (`victory_gpu::title_memory_freeing`): memory it holds in place must be
+/// let go before Windows will free or decommit it. Then Windows' own.
+pub extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    FREES.fetch_add(1, Ordering::Relaxed);
+    // A release frees the whole allocation: its size is asked of Windows.
+    let len = if size == 0 { allocation_bytes(address as usize) } else { size };
+    if len > 0 {
+        victory_gpu::title_memory_freeing(address as usize, len);
+    }
+    if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 {
+        victory_gpu::title_memory_released(address as usize);
+    }
+    let said = FREES_SAID.fetch_add(1, Ordering::Relaxed);
+    if said < 200 {
+        tracing::info!(
+            address = format_args!("{address:p}"),
+            size,
+            len,
+            kind = format_args!("{kind:#x}"),
+            "the title frees memory (VirtualFree)"
+        );
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualFree(address, size, kind) }
+}
+
+/// The title's `VirtualFree` calls since the start, and those logged.
+static FREES: AtomicUsize = AtomicUsize::new(0);
+static FREES_SAID: AtomicUsize = AtomicUsize::new(0);
+
+/// The bytes of the allocation that starts at `base` (all its regions,
+/// committed or not), or 0 if nothing is allocated there.
+fn allocation_bytes(base: usize) -> usize {
+    let mut at = base;
+    loop {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a valid out pointer of the right size; any address may be
+        // asked.
+        let n = unsafe { VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 || info.State == windows_sys::Win32::System::Memory::MEM_FREE || info.AllocationBase as usize != base {
+            return at - base;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        dlls: &["xmem.dll"],
+        dlls: &["xmem.dll", "api-ms-win-core-memory-*"],
         exports: vec![
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -1059,6 +1124,14 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
+            HleExport {
+                name: "VirtualFree",
+                address: title_virtual_free as *const () as usize,
+            },
+            HleExport {
+                name: "VirtualAlloc",
+                address: title_virtual_alloc as *const () as usize,
+            },
         ],
     }
 }

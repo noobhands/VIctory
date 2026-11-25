@@ -2771,8 +2771,145 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
+///
+/// While a shader that reaches title memory by address is bound
+/// ([`by_address`]), private title memory is the title's own, in place
+/// ([`in_place_private`]): its root views and its raw addresses then reach
+/// the same bytes (copies of the same memory, a buffer's and the window's
+/// or an enclosing buffer's, do not see each other's writes within a
+/// submission, and the builder's stages hand each other structures).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if (BY_ADDRESS.get() || everything_in_place())
+        && let Some(shadow) = in_place_private(address, len)
+    {
+        return Some(shadow);
+    }
     lookup(address, len, false)
+}
+
+thread_local! {
+    /// A shader that reaches title memory by address is being bound
+    /// ([`find`]).
+    static BY_ADDRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives (`VICTORY_MEMORY_IN_PLACE=1`, and `on`: a shader that
+/// reaches title memory by address is being bound), what [`find`] gives
+/// for private title memory is the title's own memory in place.
+pub(crate) struct ByAddress(bool);
+
+impl ByAddress {
+    pub(crate) fn new(on: bool) -> ByAddress {
+        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = on && *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_IN_PLACE").is_some_and(|v| v == "1" || v == "2"));
+        ByAddress(BY_ADDRESS.replace(on))
+    }
+}
+
+impl Drop for ByAddress {
+    fn drop(&mut self) {
+        BY_ADDRESS.set(self.0);
+    }
+}
+
+/// `VICTORY_MEMORY_IN_PLACE=2`: private title memory is in place for every
+/// shader, its tables' views too (a check that the builder's stages agree
+/// once every path reaches the same bytes; slow: draws read the title's
+/// buffers over the bus).
+fn everything_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_IN_PLACE").is_some_and(|v| v == "2"))
+}
+
+/// Whether a [`ByAddress`] is on for this thread now.
+pub(crate) fn by_address_now() -> bool {
+    BY_ADDRESS.get()
+}
+
+/// Bytes a part of private memory in place covers past its step: a
+/// structure that begins near a part's end is read whole from it.
+const PART_OVER: u64 = 64 << 20;
+/// Where parts of a run of private memory begin, from the run's start.
+const PART_STEP: u64 = 1 << 30;
+
+/// Parts of the title's private memory in place for the shaders that
+/// reach it by address, by start: kept for the run (the title frees no
+/// private memory once its world runs).
+static IN_PLACE_PRIVATE: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Where the part of a run `[start, end)` that holds `address` begins,
+/// and its bytes ([`PART_STEP`], [`PART_OVER`]).
+fn part_of(start: u64, end: u64, address: u64) -> (u64, u64) {
+    let at = start + (address - start) / PART_STEP * PART_STEP;
+    (at, (PART_STEP + PART_OVER).min(end - at))
+}
+
+/// The title's private memory around `[address, address + len)` in place:
+/// the part of its committed run that holds it, opened on first use.
+/// `None` if the memory is not a title allocation's committed private
+/// memory, or the part does not hold the range.
+pub(crate) fn in_place_private(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    // A part opened already: asked of the map alone. The run is asked of
+    // Windows only on a miss (`VirtualQuery` walks the page tables to the
+    // run's end: milliseconds in the title's big blocks, and the builder
+    // asks thousands of times a frame; asked every time, its first frame
+    // ran past the title's watchdog, `f16-priv3`).
+    {
+        let map = IN_PLACE_PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+        let end = address + len.max(1);
+        if let Some((_, shadow)) = map.range(..=address).rev().take(4).find(|(at, s)| end <= **at + s.len) {
+            return Some(shadow.clone());
+        }
+    }
+    let (start, end) = crate::inplace::private_run(address as usize)?;
+    let (at, bytes) = part_of(start as u64, end as u64, address);
+    if address + len.max(1) > at + bytes {
+        return None;
+    }
+    let mut map = IN_PLACE_PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = map.get(&at)
+        && shadow.len >= bytes.min(address + len.max(1) - at)
+    {
+        return Some(shadow.clone());
+    }
+    let placed = crate::inplace::place_by_address(at, bytes)?;
+    let shadow = Arc::new(Shadow::placed(placed, at, bytes, false));
+    tracing::debug!(start = format_args!("{at:#x}"), bytes, "private title memory in place for the shaders that reach it by address");
+    map.insert(at, shadow.clone());
+    Some(shadow)
+}
+
+/// Every committed run of the title's private memory, in place, part by
+/// part ([`in_place_private`]): for the directory's first walk.
+pub(crate) fn all_private_in_place() -> Vec<Arc<Shadow>> {
+    let mut parts = Vec::new();
+    for (base, size) in crate::inplace::title_allocations() {
+        let mut at = base as u64;
+        while at < (base + size) as u64 {
+            match crate::inplace::private_run(at as usize) {
+                Some((start, end)) => {
+                    let mut part = start as u64;
+                    while part < end as u64 {
+                        parts.extend(in_place_private(part, 1));
+                        part += PART_STEP;
+                    }
+                    at = end as u64;
+                }
+                None => {
+                    // Not committed here: on to the next region of pages.
+                    // SAFETY: plain data filled in by the query.
+                    let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out pointer of the right size.
+                    let n = unsafe { windows_sys::Win32::System::Memory::VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+                    if n == 0 {
+                        break;
+                    }
+                    at = (info.BaseAddress as u64 + info.RegionSize as u64).max(at + 1);
+                }
+            }
+        }
+    }
+    parts
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

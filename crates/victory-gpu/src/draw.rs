@@ -922,6 +922,11 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            // A shader that reaches title memory by address: its root views
+            // and its raw addresses reach private title memory in place,
+            // the same bytes (`shadow::find`, `VICTORY_MEMORY_IN_PLACE`).
+            // Not its tables: their slots are shared with other draws.
+            let _by_address = crate::shadow::ByAddress::new(t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY));
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -1146,7 +1151,8 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        // In place for a shader that reaches memory by address: another view.
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0) | u64::from(crate::shadow::by_address_now()) << 62);
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
@@ -1216,7 +1222,7 @@ impl State {
         // (title addresses stay below bit 63).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63,
+            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(crate::shadow::by_address_now()) << 62,
         );
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),

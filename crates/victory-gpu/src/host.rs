@@ -2669,6 +2669,7 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    crate::memory::after_submission();
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
