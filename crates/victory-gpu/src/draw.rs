@@ -209,6 +209,20 @@ impl Drop for State {
 }
 
 impl State {
+    /// The title's pipeline bound now.
+    pub(crate) fn pipeline_bound(&self) -> This {
+        self.pipeline as This
+    }
+
+    /// Something of ours was recorded into the host list (a copy's
+    /// pipeline and root signature): the title's next draw or dispatch
+    /// sets its pipeline, root signature, heaps and root arguments again.
+    pub(crate) fn forget_host_bindings(&mut self) {
+        self.host_pipeline = 0;
+        self.host_heaps = [usize::MAX; 2];
+        self.host_roots = [0; 2];
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -768,8 +782,16 @@ impl State {
         let instance_root = if compute && victory_shader::emit::builder_probe()
             && crate::pipeline::host_pipeline(self.pipeline as This)
                 .is_some_and(|p| p.stages.iter().any(|s| s.shader.hash == "5e68767498c57eb6"))
-            && let Some(&Root::View(root)) = self.roots_ref(true).get(3)
-        { Some(root) } else { None };
+            && let Some(&Root::View(_)) = self.roots_ref(true).get(3)
+        {
+            // Every root view by slot (0 for other roots): slot 3 is the
+            // instance table, the index stream's base is among the rest.
+            Some(self.roots_ref(true).iter().map(|r| if let Root::View(a) = r { *a } else { 0 }).collect::<Vec<u64>>())
+        } else { None };
+        #[cfg(feature = "diagnostics")]
+        if let Some(roots) = &instance_root {
+            stream_snapshots(list, roots, &constants, &who());
+        }
         crate::memory::ready(list, heap, &addresses, &constants, writes, &who, instance_root)
     }
 
@@ -1720,6 +1742,34 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::list::calls::dispatched(
+            list,
+            crate::pipeline::is_builder(self.pipeline as This),
+            || {
+                let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(|| format!("{:#x}", self.pipeline), |p| p.name.clone());
+                // Root views (slot:address, with the bytes the view
+                // reaches) and the root constants: which memory it reads
+                // and writes.
+                let mut views = Vec::new();
+                let mut constants = Vec::new();
+                for (slot, root) in self.roots_ref(true).iter().enumerate() {
+                    match root {
+                        Root::View(a) => {
+                            let left = crate::shadow::find(*a, 1).map_or(0, |s| s.left(*a));
+                            // Where its first byte is in the page pool.
+                            let at = crate::inplace::view_run(*a as usize, 1)
+                                .map_or(String::new(), |(base, _, section, _, offset)| format!("@{section:x}:{:x}", offset + (*a as usize - base) as u64));
+                            views.push(format!("{slot}:{a:#x}+{left:#x}{at}"));
+                        }
+                        Root::Constants(v) => constants.extend(v.iter().map(|c| format!("{c:x}"))),
+                        _ => {}
+                    }
+                }
+                format!("{name} views=[{}] constants=[{}]", views.join(" "), constants.join(","))
+            },
+            [x, y, z],
+        );
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1737,6 +1787,12 @@ impl State {
                 self.list_dropped_roots([x, y, z]);
             }
             return;
+        }
+        // `VICTORY_BUILDER_SERIAL=1` (a check): every stage dispatch of the
+        // structure builder waits for every shader write before it, whatever
+        // the title put between them.
+        if crate::pipeline::is_builder(self.pipeline as This) && builder_serial() {
+            crate::list::uav_barrier_all(list);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -1769,6 +1825,49 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::storetrace::on() && crate::pipeline::is_builder(self.pipeline as This) {
             crate::storetrace::note(&format!("B {}", self.op_text(format!("dispatch {x}x{y}x{z}"), true)));
+        }
+        // The builder's leaf streams on the GPU's timeline (F16).
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            let hash = p.stages.first().map(|s| s.shader.hash.clone()).unwrap_or_default();
+            let u0 = match self.roots_ref(true).get(1) {
+                Some(&Root::View(a)) => a,
+                _ => 0,
+            };
+            // The slots root views 1 and 2 are bound through, and the copy
+            // each shows (id, start, the GPU address of the view's address).
+            let slots: Vec<String> = [1usize, 2]
+                .iter()
+                .filter_map(|&s| match self.roots_ref(true).get(s) {
+                    Some(&Root::View(a)) => Some((s, a)),
+                    _ => None,
+                })
+                .map(|(s, a)| {
+                    let found = self.root_uav_slots.iter().find(|(k, _)| k.1 & ((1 << 62) - 1) == a);
+                    match found {
+                        Some((_, (index, Some(sh)))) => format!("u{s}:slot{index}/copy{}@{:#x}+gpu{:#x}", sh.id(), sh.span().0, sh.gpu(a)),
+                        Some((_, (index, None))) => format!("u{s}:slot{index}/none"),
+                        None => format!("u{s}:not-a-table"),
+                    }
+                })
+                .collect();
+            crate::streamwatch::before_dispatch(list, &format!("{} u0={u0:#x} {}", &hash[..hash.len().min(4)], slots.join(" ")));
+            if hash == "4ddd6f9702fab2a7"
+                && let Some(&Root::View(r)) = self.roots_ref(true).get(1)
+            {
+                crate::streamwatch::header_bound(list, r);
+            }
+            if (hash == "caa78b8ca62bc3d6" || hash == "28918b7150a7aad5")
+                && let Some(&Root::View(r)) = self.roots_ref(true).get(1)
+            {
+                let mut constants = Vec::new();
+                for root in self.roots_ref(true) {
+                    if let Root::Constants(v) = root {
+                        constants.extend(v.iter().take(3).map(|c| format!("{c:x}")));
+                    }
+                }
+                crate::streamwatch::box_bound(list, r, format!(" {}:{x}x{y}:{}", &hash[..4], constants.join(",")));
+            }
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
@@ -2856,4 +2955,53 @@ fn high_root(address: u64, pipeline: &str) {
         ours_mimalloc = ours,
         "a root view past 40 bits for a shader that builds addresses from 40"
     );
+}
+
+/// Diagnostics (`VICTORY_F16_RECORD`): for a bind of the leaf rehydration
+/// stage, the first 16 bytes of its packed leaf stream (root view 1 plus
+/// root constant 3) as title memory holds them when the list is recorded
+/// and again when it is submitted, with the title's mapping of the stream
+/// both times: `FS` lines in the store trace.
+#[cfg(feature = "diagnostics")]
+fn stream_snapshots(list: &HostList, roots: &[u64], constants: &[u32], who: &str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (Some(&u0), Some(&c3)) = (roots.get(1), constants.get(3)) else {
+        return;
+    };
+    if u0 == 0 || !crate::storetrace::on() {
+        return;
+    }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 4096 {
+        return;
+    }
+    let at = u0 + u64::from(c3);
+    let snap = move || {
+        let mut b = [0u8; 16];
+        let ok = crate::host::read_into(at as *const u8, &mut b);
+        let run = crate::inplace::view_run(at as usize, 1);
+        // What the section page the views name holds (what the GPU's heap
+        // shows), against the title's page at that address.
+        let section = crate::inplace::section_page_diff(at as usize);
+        // The blob at u0: its first 64 bytes, and how many of its first
+        // 4 KiB are not zero.
+        let mut blob = [0u8; 4096];
+        let filled = crate::host::read_into(u0 as *const u8, &mut blob).then(|| blob.iter().filter(|&&x| x != 0).count());
+        let head: Vec<String> = blob[..64].chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+        (ok.then_some(b), run, (section.map(|s| s.0), filled, head.join(",")))
+    };
+    let (bytes, run, section) = snap();
+    let who = who.to_owned();
+    crate::storetrace::note(&format!("FS {n} record {who} u0={u0:#x} c3={c3:#x} at={at:#x} bytes={bytes:02x?} run={run:x?} section={section:02x?}"));
+    list.defer_host(move || {
+        let (bytes, run, section) = snap();
+        crate::storetrace::note(&format!("FS {n} submit {who} at={at:#x} bytes={bytes:02x?} run={run:x?} section={section:02x?}"));
+    });
+}
+
+/// `VICTORY_BUILDER_SERIAL=1`: a barrier on every shader write before each
+/// dispatch of the structure builder ([`State::dispatch`]).
+fn builder_serial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUILDER_SERIAL").is_some_and(|v| v == "1"))
 }

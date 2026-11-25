@@ -563,3 +563,98 @@ fn two_console_waves_meet_pair_by_pair_inside_a_wave_wide_branch() {
     }
     eprintln!("ran on the hardware device: each console wave's OR, the halves meeting pair by pair");
 }
+
+/// The box stage of the ray-tracing structure builder (`caa78b8ca62bc3d6`, its words 0x7c
+/// to 0x168 as they are) sums a count over its 64-lane wave and gives each lane the sum of
+/// the lanes below it: `dpp8` swaps, `row_mirror`, `v_permlanex16`, `v_readlane` 32 for
+/// the total; `row_shr` steps, `v_permlanex16` under EXEC 0xffff0000ffff0000, `v_readlane`
+/// 31 and an add on the upper half alone for the prefix. Where each lane writes its node
+/// follows from that prefix (F16). Each lane's count here is its index & 3 (bits 24..31 of
+/// v12); lane t stores v4 = 4 (64 + the counts of the lanes below t) at dword t and the
+/// total s41 at dword 64.
+#[test]
+fn the_box_stages_prefix_over_the_wave_is_the_consoles() {
+    let mut words = vec![
+        0xBE9C_0380, // s_mov_b32 s28, 0
+        0x361E_0083, // v_and_b32 v15, 3, v0
+        0x341E_1E98, // v_lshlrev_b32 v15, 24, v15
+        0x3818_010F, // v_or_b32 v12, v15, v0
+        0xBEA8_107E, // 00007c: s_bcnt1_i32_b64 s40, exec
+        0x3610_18FF, 0x00FF_FFFF, // 00008c: v_and_b32 v8, lit(0x00ffffff), v12
+        0x2C14_1898, // 000094: v_lshrrev_b32 v10, 24, v12
+        0xBE80_25C1, // 000098: s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001, 0x0002_1480, // 00009c: v_cndmask_b32 v1, 0, v10, s[0:1]
+        0x4A02_02E9, 0xDE54_C101, // 0000a4: v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x4A02_02E9, 0x9360_1201, // 0000ac: v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x4A02_02E9, 0x0009_2401, // 0000b4: v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x4A02_02FA, 0xFF09_4001, // 0000bc: v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002, 0x0201_0101, // 0000c4: v_permlanex16_b32 v2, v1, 0, 0
+        0x4A02_0302, // 0000cc: v_add_nc_u32 v1, v2, v1
+        0xD760_0002, 0x0001_4101, // 0000d0: v_readlane_b32 s2, v1, 32
+        0x4A02_0202, // 0000d8: v_add_nc_u32 v1, s2, v1
+        0xD760_0029, 0x0001_0101, // 0000dc: v_readlane_b32 s41, v1, 0
+        0xBEFE_0400, // 0000e4: s_mov_b64 exec, s[0:1]
+        0xD764_0009, 0x0001_0108, // 0000e8: v_bcnt_u32_b32 v9, v8, 0
+        0xBE80_25C1, // 0000f0: s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001, 0x0002_1480, // 0000f4: v_cndmask_b32 v1, 0, v10, s[0:1]
+        0x7E04_0301, // 0000fc: v_mov_b32 v2, v1
+        0x4A04_04FA, 0xFF09_1102, // 000100: v_add_nc_u32 v2, v2, v2 row_shr:1 bound_ctrl:1
+        0x4A04_04FA, 0xFF01_1202, // 000108: v_add_nc_u32 v2, v2, v2 row_shr:2
+        0x4A04_04FA, 0xFF01_1402, // 000110: v_add_nc_u32 v2, v2, v2 row_shr:4
+        0x4A04_04FA, 0xFF01_1802, // 000118: v_add_nc_u32 v2, v2, v2 row_shr:8
+        0xBEFE_03FF, 0xFFFF_0000, // 000120: s_mov_b32 exec_lo, lit(0xffff0000)
+        0xBEFF_03FF, 0xFFFF_0000, // 000128: s_mov_b32 exec_hi, lit(0xffff0000)
+        0xD778_4803, 0x0305_8302, // 000130: v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x4A04_0503, // 000138: v_add_nc_u32 v2, v3, v2
+        0xD760_0002, 0x0001_3F02, // 00013c: v_readlane_b32 s2, v2, 31
+        0xBEFE_0380, // 000144: s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // 000148: s_mov_b32 exec_hi, -1
+        0x4A04_0402, // 00014c: v_add_nc_u32 v2, s2, v2
+        0xBEFE_03C1, // 000150: s_mov_b32 exec_lo, -1
+        0xBEFF_03C1, // 000154: s_mov_b32 exec_hi, -1
+        0x4C04_0302, // 000158: v_sub_nc_u32 v2, v2, v1
+        0xBEFE_0400, // 00015c: s_mov_b64 exec, s[0:1]
+        0x7E08_0302, // 000160: v_mov_b32 v4, v2
+        0x4A08_0828, // 000164: v_add_nc_u32 v4, s40, v4
+        0xD746_0004, 0x0071_0504, // 000168: v_lshl_add_u32 v4, v4, 2, s28
+    ];
+    words.extend_from_slice(&[
+        0x341A_0082, // v_lshlrev_b32 v13, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 4 << 8 | 13, // buffer_store_dword v4, v13, s[8:11], 0 offen
+        0x7E1C_0229, // v_mov_b32 v14, s41
+        0x38 << 26 | 0x1C << 18 | 256,
+        0x80 << 24 | 2 << 16 | 14 << 8, // buffer_store_dword v14, off, s[8:11], 0 offset:256
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let counts: Vec<u32> = (0..64).map(|t| t & 3).collect();
+    let total: u32 = counts.iter().sum();
+    let want: Vec<u32> = (0..64).map(|t| 4 * (64 + counts[..t].iter().sum::<u32>())).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &[View::RawUav(65)], samplers: &[], groups: [1, 1, 1] },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let got = &out[0];
+    let wrong: Vec<(usize, u32, u32)> = (0..64).filter(|&t| got[t] != want[t]).map(|t| (t, got[t], want[t])).collect();
+    assert_eq!(got[64], total, "the wave's total");
+    assert!(wrong.is_empty(), "lanes (lane, got, want): {wrong:?}");
+}

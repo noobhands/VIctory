@@ -509,6 +509,22 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // Diagnostics: what the registers point at, two levels deep (the
+    // memory a crash read its bad value from).
+    #[cfg(feature = "diagnostics")]
+    for (name, value) in [
+        ("rax", context.Rax), ("rbx", context.Rbx), ("rcx", context.Rcx), ("rdx", context.Rdx), ("rsi", context.Rsi),
+        ("rdi", context.Rdi), ("rbp", context.Rbp), ("r8", context.R8), ("r9", context.R9), ("r12", context.R12),
+        ("r13", context.R13), ("r14", context.R14), ("r15", context.R15),
+    ] {
+        let Some(first) = peek(value as usize, 8) else { continue };
+        line(format!("  [{name}] {}", hex_words(&first)));
+        for (k, q) in first.iter().enumerate() {
+            if let Some(second) = peek(*q as usize, 6) {
+                line(format!("    [{name}+{:#x}] = {q:#x} -> {}", k * 8, hex_words(&second)));
+            }
+        }
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");
@@ -621,6 +637,27 @@ fn module_of(address: usize) -> Option<String> {
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
+/// Diagnostics: `n` qwords at `address` if the process can read them (a
+/// read through the system, which cannot fault).
+#[cfg(feature = "diagnostics")]
+fn peek(address: usize, n: usize) -> Option<Vec<u64>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if address < 0x10000 {
+        return None;
+    }
+    let mut words = vec![0u64; n];
+    let mut read = 0usize;
+    // SAFETY: the system copies what is readable into our buffer.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const _, words.as_mut_ptr().cast(), n * 8, &mut read) };
+    (ok != 0 && read == n * 8).then_some(words)
+}
+
+#[cfg(feature = "diagnostics")]
+fn hex_words(words: &[u64]) -> String {
+    words.iter().map(|w| format!("{w:016x}")).collect::<Vec<_>>().join(" ")
+}
+
 fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,

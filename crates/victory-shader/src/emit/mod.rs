@@ -608,8 +608,9 @@ pub fn builder_probe() -> bool {
 }
 
 /// Dwords following the normal fault table: claim, record index, pointer
-/// low/high, effective address low/high, linear group thread, group X.
-pub const BUILDER_SAMPLE: u32 = 8;
+/// low/high, effective address low/high, linear group thread, group X, then
+/// the index stream: base low/high, byte offset, the two words read, the shift.
+pub const BUILDER_SAMPLE: u32 = 16;
 
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(

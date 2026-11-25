@@ -477,6 +477,10 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let page_waits = PAGE_WAITS.swap(0, Ordering::Relaxed);
+            if page_waits > 0 {
+                tracing::info!(page_waits, "dstorage: requests waited for the title to fill their page arrays");
+            }
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -843,6 +847,54 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     Ok(())
 }
 
+/// How long a request into physical pages waits for the title to fill its
+/// page array ([`wait_for_pages`]).
+const PAGE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The `n` page numbers at `array` once `known` says they are all there
+/// (title memory the title fills on another thread, read afresh each
+/// time), and whether they were; after `most`, what they are by then.
+fn wait_for_pages(
+    array: *const usize,
+    n: usize,
+    offset: usize,
+    len: usize,
+    known: impl Fn(&[usize], usize, usize) -> bool,
+    most: std::time::Duration,
+) -> (Vec<usize>, bool) {
+    let started = std::time::Instant::now();
+    let mut waited = 0u32;
+    loop {
+        // SAFETY: the title's array of `n` page numbers, which it writes
+        // meanwhile: read whole each time, never kept.
+        let pages: Vec<usize> = (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect();
+        if known(&pages, offset, len) {
+            if waited > 0 {
+                PAGE_WAITS.fetch_add(1, Ordering::Relaxed);
+            }
+            return (pages, true);
+        }
+        if started.elapsed() >= most {
+            return (pages, false);
+        }
+        waited += 1;
+        if waited < 64 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// Requests that had to wait for their page arrays (diagnostics).
+static PAGE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_DSTORAGE_TRACE=1`: requests into physical pages are logged.
+fn dstorage_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_TRACE").is_some_and(|v| v == "1"))
+}
+
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
@@ -948,6 +1000,14 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    into_destination_pages(request, len, fill)
+}
+
+fn into_destination_pages(
+    request: &Request,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
@@ -955,25 +1015,77 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let done = fill(out).map(drop);
+        #[cfg(feature = "diagnostics")]
+        if dstorage_trace() {
+            victory_gpu::store_trace_note(&format!("DSA ok={} at={:#x} len={len:#x}", done.is_ok(), request.destination as usize));
+        }
+        return done;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    // The title fills the page array after submitting the request (the
+    // console reads it when it gets to the request): read too early, it
+    // still held zeros, the request failed and its pages kept whatever
+    // their last user left there, which the title then took for the asset
+    // (F16: drawables full of the ray-tracing builder's nodes,
+    // `f16-dsfix2`). Waited for until every page is known.
+    let (pages, _) = wait_for_pages(
+        request.destination.cast::<usize>().cast_const(),
+        (offset + len).div_ceil(PAGE),
+        offset,
+        len,
+        super::xmem::pages_known,
+        PAGE_WAIT,
+    );
+    let pages = pages.as_slice();
+    // `VICTORY_DSTORAGE_TRACE=1`: where each request into physical pages
+    // lands (the page numbers, and the section runs they resolve to).
+    if dstorage_trace() {
+        let name = if request.name.is_null() {
+            String::new()
+        } else {
+            // SAFETY: the title's request names are NUL-terminated strings.
+            unsafe { std::ffi::CStr::from_ptr(request.name) }.to_string_lossy().into_owned()
+        };
+        tracing::info!(
+            target: "dstorage_pages",
+            raw = format_args!("{:#x}", request.page_offset),
+            destination_size = request.destination_size,
+            options = format_args!("{:#x}", request.options),
+            offset,
+            len,
+            pages = format_args!("{:x?}", &pages[..pages.len().min(8)]),
+            runs = super::xmem::describe_runs(pages, offset, len),
+            name,
+            "dstorage: into physical pages"
+        );
+    }
+    // Diagnostics: when the bytes landed, and where, on the store trace's
+    // clock (`DSW` lines, with `VICTORY_DSTORAGE_TRACE=1`).
+    #[cfg(feature = "diagnostics")]
+    let landed = |done: &Result<(), HRESULT>| {
+        if dstorage_trace() {
+            victory_gpu::store_trace_note(&format!(
+                "DSW ok={} offset={offset:#x} len={len:#x} runs={}",
+                done.is_ok(),
+                super::xmem::describe_runs(pages, offset, len)
+            ));
+        }
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let done = fill(window.bytes()).map(drop);
+        drop(window);
+        #[cfg(feature = "diagnostics")]
+        landed(&done);
+        return done;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        #[cfg(feature = "diagnostics")]
+        landed(&Ok(()));
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
@@ -1076,6 +1188,30 @@ mod tests {
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
         queue
+    }
+
+    /// A request whose page array the title fills only after submitting
+    /// waits for it: the pages are read once they are all known, not
+    /// before (the request failed and its pages kept their old bytes).
+    #[test]
+    fn pages_are_waited_for_until_the_title_has_filled_them() {
+        let array = std::sync::Arc::new([std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)]);
+        let filler = {
+            let array = array.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                array[0].store(7, std::sync::atomic::Ordering::Release);
+                array[1].store(9, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let known = |pages: &[usize], _: usize, _: usize| pages.iter().all(|&p| p != 0);
+        let got = wait_for_pages(array.as_ptr().cast(), 2, 0, 2 * PAGE, known, std::time::Duration::from_secs(2));
+        filler.join().unwrap();
+        assert_eq!(got, (vec![7, 9], true));
+        // Never filled: given up after the wait, as they were.
+        let never = [0usize; 1];
+        let (pages, ok) = wait_for_pages(never.as_ptr(), 1, 0, 16, known, std::time::Duration::from_millis(20));
+        assert_eq!((pages, ok), (vec![0], false));
     }
 
     fn request(

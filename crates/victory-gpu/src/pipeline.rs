@@ -325,6 +325,31 @@ fn back_allowed(hash: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| hash.starts_with(p.as_str()))
 }
 
+/// The thread-group size of the title's compute pipeline `this` (its
+/// program's `[numthreads]`), from the console program in its container;
+/// `None` for anything else.
+#[cfg(windows)]
+pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return None;
+    }
+    let [shader] = pipeline(this).shaders.as_slice() else { return None };
+    if shader.stage != "compute" {
+        return None;
+    }
+    static SIZES: Mutex<Option<HashMap<String, Option<[u32; 3]>>>> = Mutex::new(None);
+    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    *sizes.get_or_insert_with(HashMap::new).entry(shader.hash.clone()).or_insert_with(|| {
+        let c = Container::parse(&shader.container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        })
+    })
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

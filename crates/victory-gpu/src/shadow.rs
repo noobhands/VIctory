@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// For page-pool view memory in place ([`in_place_view`]): the section
+    /// and the offset in it of `start`, as mapped when it was placed.
+    view_of: Option<(usize, u64)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1701,6 +1704,31 @@ impl Shadow {
         self.id
     }
 
+    /// For the diagnostics' record probe: what the copy is (in place, a
+    /// window, in the card's memory, or a plain copy), and the eight bytes
+    /// its CPU side holds at `address` (none in place: those are title
+    /// memory's).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn describe(&self, address: u64) -> String {
+        let kind = if self.place.is_some() {
+            "in_place"
+        } else if self.card.is_some() {
+            "card"
+        } else if self.window {
+            "window"
+        } else {
+            "copy"
+        };
+        let at = self.offset_in(address).filter(|&at| at + 8 <= self.len);
+        let bytes = at.filter(|_| self.place.is_none() && !self.data.is_null()).map(|at| {
+            let mut b = [0u8; 8];
+            // SAFETY: the mapping covers the copy's `len` bytes; `at + 8` lies inside.
+            unsafe { std::ptr::copy_nonoverlapping(self.data.add(at as usize), b.as_mut_ptr(), 8) };
+            (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), u32::from_le_bytes([b[4], b[5], b[6], b[7]]))
+        });
+        format!("{kind}#{} {:#x}+{:#x} copy_words={bytes:x?}", self.id, self.start, self.len)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -1756,7 +1784,20 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            view_of: None,
         }
+    }
+
+    /// Whether this is title memory in place (a buffer placed over the
+    /// title's own pages), not a copy of it.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// The section and offset of `start` this in-place view memory was
+    /// placed over ([`in_place_view`]); `None` for anything else.
+    pub(crate) fn view_of(&self) -> Option<(usize, u64)> {
+        self.view_of
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2800,12 +2841,60 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// or an enclosing buffer's, do not see each other's writes within a
 /// submission, and the builder's stages hand each other structures).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    if (BY_ADDRESS.get() || everything_in_place())
-        && let Some(shadow) = in_place_private(address, len)
-    {
-        return Some(shadow);
+    if BY_ADDRESS.get() || everything_in_place() {
+        if let Some(shadow) = in_place_private(address, len) {
+            return Some(shadow);
+        }
+        // The page pool's views too: the builder's scratch lies there, and
+        // its passes write it by address, in place; a root view of it from
+        // a window copy read what an earlier build left in the copy
+        // (`f16-rec7`: bounds where the instance indices are).
+        if let Some(shadow) = in_place_view(address, len) {
+            return Some(shadow);
+        }
     }
     lookup(address, len, false)
+}
+
+/// Bytes of the title's views a root view in place reaches past its
+/// address at most (a root view reads to its buffer's end).
+const VIEW_RUN: u64 = 16 << 20;
+
+/// The title's view memory in place, by first address, section and offset
+/// (an address mapped anew is another key).
+static IN_PLACE_VIEWS: Mutex<BTreeMap<(u64, usize, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// `[address, address + len)` of the title's page-pool views in place: the
+/// run of one committed section's views from the view that holds
+/// `address` (up to [`VIEW_RUN`] past it). `None` if a view does not hold
+/// it, the run does not hold the range, or the host refused.
+pub(crate) fn in_place_view(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let (base, bytes, section, section_bytes, offset) = crate::inplace::view_run(address as usize, VIEW_RUN as usize)?;
+    let (base, bytes) = (base as u64, bytes as u64);
+    if address + len.max(1) > base + bytes {
+        return None;
+    }
+    let key = (base, section, offset);
+    let mut map = IN_PLACE_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = map.get(&key)
+        && address + len.max(1) <= shadow.start + shadow.len
+    {
+        return Some(shadow.clone());
+    }
+    let placed = crate::inplace::place_view_run(base, bytes, section, section_bytes, offset)?;
+    let mut shadow = Shadow::placed(placed, base, bytes, false);
+    shadow.view_of = Some((section, offset));
+    let shadow = Arc::new(shadow);
+    tracing::debug!(start = format_args!("{base:#x}"), bytes, section = format_args!("{section:#x}"), offset, "view memory in place for the shaders that reach it by address");
+    map.insert(key, shadow.clone());
+    Some(shadow)
+}
+
+/// The title's views over `[at, at + len)` are gone: what was placed over
+/// them is let go (lists that hold it keep it alive until they are done).
+pub(crate) fn in_place_views_gone(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    IN_PLACE_VIEWS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.start + s.len <= at || s.start >= end);
 }
 
 thread_local! {

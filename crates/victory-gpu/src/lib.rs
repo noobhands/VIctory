@@ -32,6 +32,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod gpucopy;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
@@ -59,6 +61,8 @@ mod shadow;
 pub mod signature;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod storetrace;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod streamwatch;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -82,3 +86,12 @@ pub use watch::{
 #[cfg(all(feature = "fast-alloc", not(all(windows, feature = "diagnostics"))))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Diagnostics: a line in the store trace (`VICTORY_STORE_TRACE`), on its
+/// clock, from the runtime's other parts (DirectStorage's writes, F16).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn store_trace_note(line: &str) {
+    if storetrace::on() {
+        storetrace::note(line);
+    }
+}

@@ -132,8 +132,13 @@ pub(crate) enum C {
     TexHashUs,
     TexDetileUs,
     TexDetiles,
+    /// Waits for every earlier shader write at the title's pipeline syncs
+    /// (`list::sync`).
+    WaitsForSyncs,
+    /// The title's buffer copies made on the GPU (`gpucopy`).
+    GpuCopies,
 }
-const _: () = assert!((C::TexDetiles as usize) < COUNTERS);
+const _: () = assert!((C::GpuCopies as usize) < COUNTERS);
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
@@ -1292,11 +1297,14 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         for its barriers on buffers, {:.0} for its pipeline syncs; {:.0} indirect commands bounded (a \
+         dispatch of ours between two such waits each); {:.0} title buffer copies on the GPU; barrier \
+         experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
+        c[C::WaitsForSyncs as usize],
         c[C::IndirectBounded as usize],
+        c[C::GpuCopies as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of

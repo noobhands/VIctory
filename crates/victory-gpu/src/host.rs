@@ -3614,6 +3614,12 @@ impl Host {
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         let _ = self.submit(runs, false);
+        // The submission has run: the diagnostics' records of it.
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::streamwatch::report();
+            crate::streamwatch::report_extents();
+        }
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -4415,6 +4421,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        #[cfg(feature = "diagnostics")]
+        crate::streamwatch::list_done(self);
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5119,6 +5127,7 @@ impl HostList {
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
+                        stale_view_check(shadow, *address, *len);
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -5167,6 +5176,41 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+    }
+}
+
+/// Diagnostics: at submission, whether page-pool view memory placed in
+/// place for a root view still shows what the title maps at its addresses
+/// now ([`crate::shadow::in_place_view`] places it when the list is
+/// recorded; the console's GPU reads the page tables when the work runs).
+/// A mismatch is counted and the first ones told (`SV` lines in the store
+/// trace).
+#[cfg(feature = "diagnostics")]
+fn stale_view_check(shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    use std::sync::atomic::AtomicU64;
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    let Some((section, offset)) = shadow.view_of() else {
+        return;
+    };
+    let (start, bytes) = shadow.span();
+    let end = (address + len.max(1)).min((start + bytes) as usize);
+    let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    let want = offset + (address as u64 - start);
+    let now = crate::inplace::view_run(address, end - address);
+    let same = now.is_some_and(|(base, run, s, _, o)| s == section && o + (address - base) as u64 == want && base + run >= end);
+    if !same {
+        let n = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 64 && crate::storetrace::on() {
+            crate::storetrace::note(&format!(
+                "SV {n} of {checked} address={address:#x} len={len:#x} placed=({section:#x},{want:#x}) start={start:#x}+{bytes:#x} now={now:x?}"
+            ));
+        }
+        if n <= 8 {
+            tracing::warn!(address = format_args!("{address:#x}"), n, checked, "a root view in place no longer shows what the title maps there at submission");
+        }
+    } else if checked.is_power_of_two() && checked >= 1024 {
+        tracing::info!(checked, stale = STALE.load(Ordering::Relaxed), "root views in place checked at submission");
     }
 }
 

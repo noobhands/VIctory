@@ -125,7 +125,7 @@ fn stride() -> usize {
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct FaultSlice {
     who: String,
-    instance_root: Option<u64>,
+    instance_root: Option<Vec<u64>>,
 }
 
 /// A part of a committed section of the page pool as one buffer placed in
@@ -470,20 +470,91 @@ impl Memory {
             }
             #[cfg(feature = "diagnostics")]
             if let Some(meta) = slice.checked_sub(1).and_then(|i| used.get(i))
-                && let Some(root) = meta.instance_root
+                && let Some(roots) = &meta.instance_root
+                && let Some(&root) = roots.get(3)
                 && victory_shader::emit::builder_probe()
             {
                 // SAFETY: the extra eight dwords are allocated for every slice in probe mode.
                 let sample = unsafe { self.faults.1.add(slice * stride() + MEMORY_FAULTS as usize) };
                 // Tag 2 is published by the winning lane. Keep the record claimed until frame end.
                 if unsafe { sample.read_volatile() } == 2 {
-                    let words: [u32; 7] = std::array::from_fn(|i| unsafe { sample.add(i + 1).read_volatile() });
-                    let [index, lo, hi, addr_lo, addr_hi, lane, group] = words;
+                    let words: [u32; 13] = std::array::from_fn(|i| unsafe { sample.add(i + 1).read_volatile() });
+                    let [index, lo, hi, addr_lo, addr_hi, lane, group, s_lo, s_hi, s_off, w_lo, w_hi, shift] = words;
                     let record = root.checked_add(u64::from(index) * 48);
                     let mut bytes = [0; 8];
                     let cpu = record.filter(|&r| crate::host::read_into(r as *const u8, &mut bytes))
                         .map(|_| u64::from_le_bytes(bytes));
-                    crate::storetrace::note(&format!("FI {slice} {} root={root:#x} group_x={group} thread={lane} index={index} record={record:#x?} pointer={hi:08x}{lo:08x} effective={addr_hi:08x}{addr_lo:08x} cpu_at_readback={cpu:#x?}", meta.who));
+                    // The index stream as the console reads it: the
+                    // descriptor's 48-bit base plus the byte offset; the
+                    // two words there now, against the two the shader read.
+                    let stream = (u64::from(s_lo) | u64::from(s_hi & 0xffff) << 32).wrapping_add(u64::from(s_off));
+                    let words_at = |at: u64| {
+                        let mut now = [0u8; 8];
+                        crate::host::read_into(at as *const u8, &mut now).then(|| {
+                            (u32::from_le_bytes([now[0], now[1], now[2], now[3]]), u32::from_le_bytes([now[4], now[5], now[6], now[7]]))
+                        })
+                    };
+                    let cpu_words = words_at(stream);
+                    // With no base in the sample (a root descriptor's), the
+                    // words at offset past every root view, by slot.
+                    let by_root: Vec<String> = roots.iter().enumerate().filter(|&(_, &r)| r != 0)
+                        .map(|(i, &r)| format!("{i}:{r:#x}->{:x?}", words_at(r + u64::from(s_off))))
+                        .collect();
+                    // The stream's buffer as the GPU side holds it (root
+                    // view 1), and where the words the GPU read lie in
+                    // title memory within 1 MiB of the stream, if anywhere.
+                    let stream_root = roots.get(1).copied().unwrap_or(0);
+                    let at1 = stream_root + u64::from(s_off);
+                    let holder = [crate::shadow::in_place_private(at1, 8), crate::shadow::find_any(at1, 8)]
+                        .map(|s| s.map_or_else(|| "none".to_string(), |s| s.describe(at1)));
+                    // What Windows says of the stream's page.
+                    let query = {
+                        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                        // SAFETY: plain data filled in by the query.
+                        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        // SAFETY: a valid out pointer of the right size.
+                        let n = unsafe { VirtualQuery(at1 as *const _, &mut info, size_of_val(&info)) };
+                        if n == 0 {
+                            "none".to_string()
+                        } else {
+                            format!(
+                                "alloc={:#x} base={:#x}+{:#x} state={:#x} type={:#x} protect={:#x} title_alloc={}",
+                                info.AllocationBase as u64, info.BaseAddress as u64, info.RegionSize, info.State, info.Type, info.Protect,
+                                crate::inplace::title_allocations().iter().any(|&(b, n)| (b as u64) <= at1 && at1 < (b + n) as u64)
+                            )
+                        }
+                    };
+                    let run = crate::inplace::view_run(at1 as usize, 1 << 24);
+                    let mut seen = Vec::new();
+                    if (w_lo, w_hi) != (0, 0) && stream_root != 0 {
+                        let from = at1.saturating_sub(1 << 20) & !3;
+                        let mut chunk = vec![0u8; 4096 + 8];
+                        let mut a = from;
+                        while a < at1 + (1 << 20) && seen.len() < 6 {
+                            if crate::host::read_into(a as *const u8, &mut chunk) {
+                                for k in (0..4096).step_by(4) {
+                                    let lo = u32::from_le_bytes([chunk[k], chunk[k + 1], chunk[k + 2], chunk[k + 3]]);
+                                    let hi = u32::from_le_bytes([chunk[k + 4], chunk[k + 5], chunk[k + 6], chunk[k + 7]]);
+                                    if (lo, hi) == (w_lo, w_hi) && seen.len() < 6 {
+                                        seen.push(format!("{:+#x}", (a + k as u64) as i64 - at1 as i64));
+                                    }
+                                }
+                            }
+                            a += 4096;
+                        }
+                    }
+                    let unpacked = ((u64::from(w_hi) << 32 | u64::from(w_lo)) >> (shift & 31)) as u32 & 0xff_ffff;
+                    crate::storetrace::note(&format!(
+                        "FI {slice} {} root={root:#x} group_x={group} thread={lane} index={index} record={record:#x?} pointer={hi:08x}{lo:08x} effective={addr_hi:08x}{addr_lo:08x} cpu_at_readback={cpu:#x?} \
+                         stream_base={s_hi:08x}{s_lo:08x} stream_offset={s_off:#x} stream_at={stream:#x} gpu_words={w_lo:08x},{w_hi:08x} shift={shift:#x} unpacked={unpacked} cpu_words={cpu_words:x?} by_root=[{}] place_private={} place_any={} gpu_words_found_at=[{}] query={} view_run={:x?}",
+                        meta.who,
+                        by_root.join(" "),
+                        holder[0],
+                        holder[1],
+                        seen.join(","),
+                        query,
+                        run
+                    ));
                     unsafe { sample.write_volatile(3) };
                 }
             }
@@ -529,6 +600,12 @@ impl Memory {
 /// stop on what it built before that frame ends). The slices keep their
 /// names until the frame ends.
 pub(crate) fn after_submission() {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::streamwatch::report();
+        crate::streamwatch::report_extents();
+        crate::gpucopy::report();
+    }
     if !by_dispatch() {
         return;
     }
@@ -612,7 +689,7 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
     who: &dyn Fn() -> String,
-    instance_root: Option<u64>,
+    instance_root: Option<Vec<u64>>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {

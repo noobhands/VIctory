@@ -628,6 +628,22 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Whether every page of `pages` behind bytes `[offset, offset + len)` is
+/// one the runtime knows.
+pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    runs(pages, offset, len).is_some()
+}
+
+/// The section runs bytes `[offset, offset + len)` of `pages` resolve to,
+/// as text (section handle, first slice, slices), or why not (diagnostics
+/// of the DirectStorage trace).
+pub(crate) fn describe_runs(pages: &[usize], offset: usize, len: usize) -> String {
+    match runs(pages, offset, len) {
+        Some(runs) => runs.iter().map(|(s, n)| format!("{:#x}:{:#x}x{n}", s.section.0 as usize, s.index * PAGE)).collect::<Vec<_>>().join(" "),
+        None => "unknown page".to_owned(),
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view

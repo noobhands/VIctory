@@ -2765,8 +2765,10 @@ impl<'a> Lower<'a> {
     }
 
     /// One active lane reaching the directory sentinel wins this slice.
-    /// The record holds that lane's SSA index and both ends of the address calculation.
-    fn sample_instance(&mut self, index: V, ptr: (V, V), addr: (V, V), guard: Option<V>) {
+    /// The record holds that lane's SSA index and both ends of the address calculation,
+    /// then the index stream it was unpacked from: base lo/hi, byte offset, the two
+    /// words read and the shift.
+    fn sample_instance(&mut self, index: V, ptr: (V, V), addr: (V, V), guard: Option<V>, stream: [V; 6]) {
         let c = self.cur;
         let k8 = self.s.m.i32(255);
         let high = self.s.m.bin(c, Bin::And, addr.1, k8);
@@ -2795,7 +2797,8 @@ impl<'a> Lower<'a> {
         let group = self.s.op(self.cur, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
         let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
-        for (i, value) in [index, ptr.0, ptr.1, addr.0, addr.1, tid, group].into_iter().enumerate() {
+        let [base_lo, base_hi, offset, w_lo, w_hi, shift] = stream;
+        for (i, value) in [index, ptr.0, ptr.1, addr.0, addr.1, tid, group, base_lo, base_hi, offset, w_lo, w_hi, shift].into_iter().enumerate() {
             let byte = self.s.m.i32(base + 4 * (1 + i as u32));
             self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140,
                 &[h, byte, iu, value, iu, iu, iu, mask, align]);
@@ -2876,8 +2879,42 @@ impl<'a> Lower<'a> {
                     p.machine.offset == 0x174 && p.write(Reg::V(17)) == inst.read(Reg::V(17))
                     && p.write(Reg::V(18)) == inst.read(Reg::V(18)))
                     .ok_or("F16 instance pointer changed before the global load")?;
-                let index = self.i32_of(producer.read(Reg::V(1)).ok_or("F16 record index")?)?;
-                self.sample_instance(index, pointer, (lo, hi), guard);
+                let index_value = producer.read(Reg::V(1)).ok_or("F16 record index")?;
+                let index = self.i32_of(index_value)?;
+                // Back from the index to the stream it was unpacked from:
+                // `v_and_b32 v1, 0xffffff, v11` <- `v_alignbit_b32 v11, v2,
+                // v1, v3` <- `buffer_load_dwordx2 v[1:2], v1, s[32:35] offen`.
+                let writer = |value| {
+                    self.x.p.blocks.iter().flat_map(|block| &block.insts).find(|p| p.writes.iter().any(|&(_, w)| w == value))
+                };
+                let and = writer(index_value).ok_or("F16 index mask")?;
+                let align = writer(and.read(Reg::V(11)).ok_or("F16 index bits")?).ok_or("F16 alignbit")?;
+                let (w_lo, w_hi, shift) = (
+                    align.read(Reg::V(1)).ok_or("F16 word lo")?,
+                    align.read(Reg::V(2)).ok_or("F16 word hi")?,
+                    align.read(Reg::V(3)).ok_or("F16 shift")?,
+                );
+                let load = writer(w_lo).ok_or("F16 stream load")?;
+                let (offset, base_lo, base_hi) = (
+                    load.read(Reg::V(1)).ok_or("F16 stream offset")?,
+                    load.read(Reg::S(32)).ok_or("F16 stream base lo")?,
+                    load.read(Reg::S(33)).ok_or("F16 stream base hi")?,
+                );
+                // A descriptor built around a root descriptor has no
+                // base here: 0, and the host tries the root views.
+                let (base_lo, base_hi) = match (self.i32_of(base_lo), self.i32_of(base_hi)) {
+                    (Ok(lo), Ok(hi)) => (lo, hi),
+                    _ => (self.s.m.i32(0), self.s.m.i32(0)),
+                };
+                let stream = [
+                    base_lo,
+                    base_hi,
+                    self.i32_of(offset)?,
+                    self.i32_of(w_lo)?,
+                    self.i32_of(w_hi)?,
+                    self.i32_of(shift)?,
+                ];
+                self.sample_instance(index, pointer, (lo, hi), guard, stream);
             }
             return Ok(());
         }
