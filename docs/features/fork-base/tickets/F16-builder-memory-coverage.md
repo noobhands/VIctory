@@ -5,7 +5,7 @@
 **Requirements addressed:** correct shader output (lighting in shadow)
 
 ### Plan
-1. Every committed page of the title's memory reachable before the first builder dispatch: with F08, placed buffers over the title's own memory (no copy, always current), numbered in the directory up front (a walk of the title's allocations; `VICTORY_MEMORY_COPIES` sized for them).
+1. Every committed page of the title's memory reachable before the first builder dispatch, through the directory (`memory.rs`) pointed at the title's own memory instead of copies: the page pool's committed sections as one heap each (F08 `section_heap`; a 6.2 GB section needs two views, a raw view reaches 4 GB), private allocations by part (`place_part`), numbered up front. In place only for the by-address shaders (the builder, the trace programs): F08 measured that hot draw data must stay in VRAM.
 2. Until then, a measured fallback: map all committed private memory before the first builder dispatch and see whether the fault lists empty and an unquarantined run survives (memory: about 19 GB of host copies; refresh cost per dispatch).
 3. Reads of uncommitted memory after that are wrong addresses: compare a stage's inputs and outputs on the first build (`VICTORY_STORE_TRACE`) with what the title gave it.
 4. Then copy-back without quarantine; captures of shadowed areas against the builder-off run.

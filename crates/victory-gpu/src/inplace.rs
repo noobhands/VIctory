@@ -67,18 +67,19 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: the big ones too (in
+/// place of the card's memory: the card reads them over the bus, the CPU
+/// no longer refreshes, compares and copies them back).
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
+/// Private memory (`XMemVirtualAlloc`'s) is opened by part. View memory
+/// (the page pool) is placed when the runtime made its section committed
+/// (`VICTORY_XMEM_COMMIT=1`) and the range is one run of it; when the
+/// title maps other pages there, what was placed is let go
+/// ([`title_memory_freeing`]).
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// Shader writes through such a buffer are still declared to the flights
+/// sent ahead (`VICTORY_LATE_WAIT`; `Shadow::gpu_writes`), with nothing to
+/// copy back: a read of ours of that memory waits for them, as for a copy.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -101,8 +102,9 @@ fn most() -> u64 {
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// because of [`most`]; what was let go because its memory changed; and
+/// of all placed, those in view memory (a section's heap) and their bytes.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -134,25 +136,49 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
+///
+/// View memory (the page pool) is placed when it is one run of a section
+/// the runtime made committed (`VICTORY_XMEM_COMMIT=1`): the section is
+/// opened as one heap, once, and the buffer placed at the run's offset
+/// ([`place_view`]). Opening a section locks nothing, so [`most`] does not
+/// count it. Scattered pages, or a run with unmapped pages, stay copies.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    let section = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) => match section_bytes(section) {
+            Some(bytes) => Some((section, bytes, offset)),
+            None => {
+                STATS[4].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        },
+        Cover::Scattered | Cover::Holes => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    if section.is_none() && STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match section {
+        Some((section, bytes, offset)) => place_view(&host.device, section, bytes, offset, len),
+        None => place_part(&host.device, start, len),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            if section.is_some() {
+                STATS[8].fetch_add(1, Ordering::Relaxed);
+                STATS[9].fetch_add(len, Ordering::Relaxed);
+            }
             Some(placed)
         }
         Err(None) => {
@@ -166,6 +192,75 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// The bytes of `section` if the runtime made it committed (only such a
+/// section opens as a heap), else `None`.
+fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.iter().find(|s| s.0 == section && s.2).map(|s| s.1)
+}
+
+/// Where `len` bytes at `offset` of a section of `section_bytes` go in its
+/// heap: the 64 KiB line at or below the first byte, the bytes from there
+/// to the line at or above the last (a page at least), and the first
+/// byte's distance from the line. `None` if that reaches past the section.
+fn view_part(section_bytes: u64, offset: u64, len: u64) -> Option<(u64, u64, u64)> {
+    let k = K64 as u64;
+    let at = offset & !(k - 1);
+    let end = offset.checked_add(len.max(1))?.next_multiple_of(k);
+    (end <= section_bytes).then_some((at, end - at, offset - at))
+}
+
+/// Heaps opened on the title's committed sections, by the section's
+/// handle; `None` where the host refused (not asked again).
+struct SectionHeaps(Vec<(usize, Option<ID3D12Heap>)>);
+
+// SAFETY: the heaps are free-threaded host objects; all access is under
+// the mutex.
+unsafe impl Send for SectionHeaps {}
+
+static SECTION_HEAPS: Mutex<SectionHeaps> = Mutex::new(SectionHeaps(Vec::new()));
+
+/// The heap of `section`, opened on first use. `Err` with the host's
+/// error the first time it refuses, with nothing after.
+fn section_heap(device: &ID3D12Device, section: usize) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, heap)) = heaps.0.iter().find(|h| h.0 == section) {
+        return heap.clone().ok_or(None);
+    }
+    let opened = open(device, From::Section(section));
+    heaps.0.push((section, opened.as_ref().ok().cloned()));
+    if opened.is_ok() {
+        tracing::info!(section = format_args!("{section:#x}"), "a committed section of the title's page pool opened as one heap");
+    }
+    opened.map_err(Some)
+}
+
+/// Forgets the heap of `section` (the section is gone; the heap lives on
+/// in what was placed in it).
+pub(crate) fn forget_section_heap(section: usize) {
+    SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).0.retain(|h| h.0 != section);
+}
+
+/// The runtime is closing `section`'s handle: its record and heap are
+/// forgotten (a later section may get the same handle). What was placed
+/// in the heap keeps it, and the section's memory, alive.
+pub fn title_memory_section_gone(section: usize) {
+    views().sections.retain(|s| s.0 != section);
+    forget_section_heap(section);
+}
+
+/// Places `len` bytes at `offset` of `section` (of `bytes`, committed) in
+/// the section's heap ([`view_part`]): the title memory a run of the
+/// section's pages shows, in place. `Err` with nothing if it reaches past
+/// the section, with the host's error if it refused.
+pub(crate) fn place_view(device: &ID3D12Device, section: usize, bytes: u64, offset: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let (at, size, bias) = view_part(bytes, offset, len).ok_or(None)?;
+    let heap = section_heap(device, section)?;
+    let buffer = place(device, &heap, at, size).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, bias })
 }
 
 /// What [`place_for`] gave is gone.
@@ -200,7 +295,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; placed in a section's heap since the start: {} of {} MB",
         s[0],
         s[1] >> 20,
         s[2],
@@ -208,7 +303,9 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        s[8],
+        s[9] >> 20
     );
 }
 
@@ -966,8 +1063,8 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 
 /// Called once a second by the thread that submits, before a submission
 /// (`host::sweep`): with [`probe_level`], the probe at the first call, the
-/// census (on a thread of its own: it asks Windows about every copy) 30
-/// and 150 seconds later.
+/// census (on a thread of its own: it asks Windows about every copy) 30,
+/// 150 and 300 seconds later.
 pub(crate) fn tick() {
     if level() > 0 {
         say();
@@ -994,9 +1091,12 @@ pub(crate) fn tick() {
         }
         Err(started) => started,
     };
+    // The third in the world (the menus and loading take about three
+    // minutes).
     let due = match DONE.load(Ordering::Relaxed) {
         0 => now >= started + 30_000,
         1 => now >= started + 150_000,
+        2 => now >= started + 300_000,
         _ => false,
     };
     if due {
@@ -1145,6 +1245,62 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Where a title buffer that is one run of a section goes in the
+    /// section's heap: from the 64 KiB line below its first byte to the
+    /// one above its last, the buffer's first byte that far in; nothing
+    /// past the section's end.
+    #[test]
+    fn a_run_of_a_section_is_placed_on_its_pages() {
+        let k = K64 as u64;
+        assert_eq!(view_part(16 * k, 3 * k + 0x1230, 2 * k + 5), Some((3 * k, 3 * k, 0x1230)));
+        assert_eq!(view_part(16 * k, 4 * k, k), Some((4 * k, k, 0)));
+        assert_eq!(view_part(16 * k, 15 * k, k), Some((15 * k, k, 0)));
+        assert_eq!(view_part(16 * k, 15 * k + 1, k), None, "past the section's end");
+        assert_eq!(view_part(16 * k, 4 * k, 0), Some((4 * k, k, 0)), "an empty ask holds a page");
+    }
+
+    /// A title buffer in view memory that is one run of a committed
+    /// section: the section opened as one heap, a buffer placed at the
+    /// run's offset; the GPU reads the bytes the title wrote through its
+    /// view and its write shows through the view. A run of a section that
+    /// is not committed is refused by the host.
+    #[test]
+    fn warp_a_buffer_in_view_memory_is_placed_in_its_sections_heap() {
+        let Some(device) = warp() else { return };
+        const SIZE: usize = 16 * K64;
+        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        // SAFETY: a section and a view of the test's own.
+        unsafe {
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            // The view shows the section from its fifth page on, as the
+            // runtime maps pages: the title's address and the section's
+            // offset differ.
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, (4 * K64) as u32, 8 * K64);
+            let base = view.Value.cast::<u8>();
+            assert!(!base.is_null());
+            let (start, len) = (base as u64 + K64 as u64 + 0x40, 2 * K64 as u64);
+            fill(start as *mut u8, len as usize, 3);
+            let offset = (5 * K64 + 0x40) as u64;
+            let placed = place_view(&device, handle as usize, SIZE as u64, offset, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x40);
+            let mut rig = Rig::new(&device).unwrap();
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads what the title wrote through its view");
+            rig.store(&placed.buffer, placed.bias + 8, &[0x5a; 32]).unwrap();
+            assert!(same((start + 8) as *const u8, &[0x5a; 32]), "the GPU's write shows through the view");
+            drop(placed);
+            forget_section_heap(handle as usize);
+            let _ = mem::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            // A reserved section: the host refuses its heap.
+            let reserved = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
+            assert!(matches!(place_view(&device, reserved as usize, SIZE as u64, 0, K64 as u64), Err(Some(_))));
+            forget_section_heap(reserved as usize);
+            windows_sys::Win32::Foundation::CloseHandle(reserved);
         }
     }
 

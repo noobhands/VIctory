@@ -1777,11 +1777,14 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back (`writing`, `copy_back` and
+        // `copy_back_done` pass it by). With flights sent ahead the range
+        // is still declared, so that a read of ours there waits for them
+        // (`host::late_blocked`); without, no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() && !crate::host::late() {
             return;
         }
         let len = len.min(self.left(address));
@@ -2820,7 +2823,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        // (`VICTORY_INPLACE=3`: those too.)
+        let big = cards() && size >= card_limits().0 && crate::inplace::level() < 3;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();

@@ -18,7 +18,7 @@ Remote ID: _(unpublished, local-first)_
 | [F05](tickets/F05-close-wave64-investigation.md) | Close the wave64-mesh investigation (its T06) | F01 | — | TO-DO |
 | [F06](tickets/F06-next-targets.md) | Next targets on the fork: frame time, stability margin, drops | F01-F04 | — | TO-DO |
 | [F07](tickets/F07-frame-time-decomposition.md) | Where a frame's time goes (to 33 ms) | F01 | — | IN PROGRESS |
-| [F08](tickets/F08-title-memory-in-place.md) | Title memory used in place by the GPU | F07 | — | TO-DO |
+| [F08](tickets/F08-title-memory-in-place.md) | Title memory used in place by the GPU | F07 | — | IN PROGRESS |
 | [F09](tickets/F09-gpu-hotspots.md) | GPU time hotspots | F07 | — | TO-DO |
 | [F10](tickets/F10-texture-path.md) | Texture uploads and detiling | F07 | — | IN PROGRESS |
 | [F11](tickets/F11-large-dispatches.md) | Dispatches of more than 65,535 groups in a dimension | F01 | — | TO-DO |
@@ -27,3 +27,4 @@ Remote ID: _(unpublished, local-first)_
 | [F14](tickets/F14-allocator-contention.md) | The process heap's lock (allocator contention) | user | — | IN PROGRESS |
 | [F15](tickets/F15-intro-video-regression.md) | The intro video flickers and zooms (regression) | — | — | DONE |
 | [F16](tickets/F16-builder-memory-coverage.md) | The builder sees all the title memory it reads (ray-traced lighting) | F12, F08 | — | TO-DO |
+| [F17](tickets/F17-shadow-trace-programs.md) | The shadow-mask trace programs that do not translate | — | — | TO-DO |
