@@ -750,7 +750,12 @@ impl State {
             }
         }
         let who = || crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(String::new, |p| p.name.clone());
-        crate::memory::ready(list, heap, &addresses, &constants, writes, &who)
+        let instance_root = if compute && victory_shader::emit::builder_probe()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.stages.iter().any(|s| s.shader.hash == "5e68767498c57eb6"))
+            && let Some(&Root::View(root)) = self.roots_ref(true).get(3)
+        { Some(root) } else { None };
+        crate::memory::ready(list, heap, &addresses, &constants, writes, &who, instance_root)
     }
 
     /// The bound heap holding `handle`.

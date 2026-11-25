@@ -40,11 +40,12 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The switches that pick the form of a wave64 program: without them in
 /// the key a run with `VICTORY_WAVE_WIDE=0` was served the translations an
 /// earlier run of the same executable had cached with the switch unset.
-const FORM_SWITCHES: [&str; 4] = [
+const FORM_SWITCHES: [&str; 5] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_OWN_BITS",
     "VICTORY_F16_NEAREST",
+    "VICTORY_F16_RECORD",
 ];
 
 /// The translation settings a build runs with, as key bytes. Inputs: the

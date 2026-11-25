@@ -102,12 +102,26 @@ fn in_place() -> bool {
 /// are read when the frame's work has run).
 fn by_dispatch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULTS_BY_DISPATCH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| victory_shader::emit::builder_probe()
+        || std::env::var_os("VICTORY_FAULTS_BY_DISPATCH").is_some_and(|v| v == "1"))
 }
 
 /// The faults' slices past the first ([`by_dispatch`]).
 fn slices() -> u32 {
     if by_dispatch() { 8192 } else { 0 }
+}
+
+/// Dwords per dispatch, including the opt-in instance sample.
+fn stride() -> usize {
+    MEMORY_FAULTS as usize + if victory_shader::emit::builder_probe() {
+        victory_shader::emit::BUILDER_SAMPLE as usize
+    } else { 0 }
+}
+
+#[derive(Clone)]
+struct FaultSlice {
+    who: String,
+    instance_root: Option<u64>,
 }
 
 /// A part of a committed section of the page pool as one buffer placed in
@@ -169,7 +183,7 @@ struct Memory {
     refused: std::collections::HashSet<u64>,
     /// With [`by_dispatch`]: what used each slice of the faults after the
     /// first, this frame.
-    slices: Vec<String>,
+    slices: Vec<FaultSlice>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -238,7 +252,7 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         let mut m = Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS) * (1 + u64::from(slices())), "faults")?,
+            faults: make(stride() as u64 * (1 + u64::from(slices())), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
@@ -409,12 +423,18 @@ impl Memory {
     fn take_faults(&mut self) {
         let used = std::mem::take(&mut self.slices);
         self.read_faults(&used);
+        if victory_shader::emit::builder_probe() {
+            for slice in 0..=used.len() {
+                // SAFETY: the slice is being recycled after its frame, including the shared sink.
+                unsafe { self.faults.1.add(slice * stride() + MEMORY_FAULTS as usize).write_volatile(0) };
+            }
+        }
     }
 
     /// Reads (and empties) the faults of the first slice and of the slices
     /// `used` names ([`by_dispatch`]), tracing those, and gives the pages
     /// found their copies.
-    fn read_faults(&mut self, used: &[String]) {
+    fn read_faults(&mut self, used: &[FaultSlice]) {
         let mut pages = Vec::new();
         // Pages in the first half of a slice, each with the native offset
         // of the access that found it empty half further on (the shader's
@@ -426,7 +446,7 @@ impl Memory {
                 // SAFETY: inside the faults' mapping; the GPU may be
                 // writing, a number missed now is written again next frame.
                 let (at, by) = unsafe {
-                    let at = self.faults.1.add(slice * MEMORY_FAULTS as usize + i);
+                    let at = self.faults.1.add(slice * stride() + i);
                     (at, at.add(half))
                 };
                 // SAFETY: as above.
@@ -442,7 +462,26 @@ impl Memory {
             if slice > 0 && !here.is_empty() && crate::storetrace::on() {
                 here.sort_unstable();
                 let list: Vec<String> = here.iter().map(|&(p, pc)| format!("{:#x}@{pc:#x}", u64::from(p) * PAGE)).collect();
-                crate::storetrace::note(&format!("FD {slice} {} {} {}", used[slice - 1], here.len(), list.join(",")));
+                crate::storetrace::note(&format!("FD {slice} {} {} {}", used[slice - 1].who, here.len(), list.join(",")));
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(meta) = slice.checked_sub(1).and_then(|i| used.get(i))
+                && let Some(root) = meta.instance_root
+                && victory_shader::emit::builder_probe()
+            {
+                // SAFETY: the extra eight dwords are allocated for every slice in probe mode.
+                let sample = unsafe { self.faults.1.add(slice * stride() + MEMORY_FAULTS as usize) };
+                // Tag 2 is published by the winning lane. Keep the record claimed until frame end.
+                if unsafe { sample.read_volatile() } == 2 {
+                    let words: [u32; 7] = std::array::from_fn(|i| unsafe { sample.add(i + 1).read_volatile() });
+                    let [index, lo, hi, addr_lo, addr_hi, lane, group] = words;
+                    let record = root.checked_add(u64::from(index) * 48);
+                    let mut bytes = [0; 8];
+                    let cpu = record.filter(|&r| crate::host::read_into(r as *const u8, &mut bytes))
+                        .map(|_| u64::from_le_bytes(bytes));
+                    crate::storetrace::note(&format!("FI {slice} {} root={root:#x} group_x={group} thread={lane} index={index} record={record:#x?} pointer={hi:08x}{lo:08x} effective={addr_hi:08x}{addr_lo:08x} cpu_at_readback={cpu:#x?}", meta.who));
+                    unsafe { sample.write_volatile(3) };
+                }
             }
             pages.extend(here.into_iter().map(|(page, _)| page));
         }
@@ -569,6 +608,7 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
     who: &dyn Fn() -> String,
+    instance_root: Option<u64>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -636,8 +676,8 @@ pub(crate) fn ready(
     }
     // A slice of the faults of its own ([`by_dispatch`]).
     let faults = if (m.slices.len() as u32) < slices() {
-        m.slices.push(who());
-        m.faults.2 + m.slices.len() as u64 * u64::from(MEMORY_FAULTS) * 4
+        m.slices.push(FaultSlice { who: who(), instance_root });
+        m.faults.2 + m.slices.len() as u64 * stride() as u64 * 4
     } else {
         m.faults.2
     };

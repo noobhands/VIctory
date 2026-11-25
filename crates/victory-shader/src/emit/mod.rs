@@ -600,6 +600,17 @@ fn widen(
     }
 }
 
+/// Whether fault slices include a sample from the F16 instance-record shader.
+pub fn builder_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_F16_RECORD").is_some_and(|v| v == "1"))
+}
+
+/// Dwords following the normal fault table: claim, record index, pointer
+/// low/high, effective address low/high, linear group thread, group X.
+pub const BUILDER_SAMPLE: u32 = 8;
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -666,7 +677,12 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    // DXBC header digest of the captured 5e68767498c57eb6 instance builder.
+    let probe = builder_probe() && c.digest == [
+        0x79, 0x8a, 0x9e, 0xfc, 0xf0, 0xc2, 0x44, 0x93,
+        0x71, 0xee, 0xde, 0xf4, 0xa4, 0xb8, 0x35, 0xf0,
+    ];
+    let l = lower::lower_probe(&lower::Parts {
         native,
         p,
         st,
@@ -676,7 +692,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    }, probe)?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

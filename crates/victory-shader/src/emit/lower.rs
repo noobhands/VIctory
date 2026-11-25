@@ -86,10 +86,17 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_probe(parts, false)
+}
+
+pub(crate) fn lower_probe(parts: &Parts, probe: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lower = Lower::new(parts, &bad);
+        lower.builder_probe = probe;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -252,6 +259,7 @@ struct Lower<'a> {
     /// The native offset of the instruction being lowered (for the
     /// faults' record of which access found no copy, [`Self::memory`]).
     inst_at: u32,
+    builder_probe: bool,
     /// With `local`: every mask read and lane read is taken per host wave
     /// ([`with_local_waves_any`]).
     local_any: bool,
@@ -1543,6 +1551,7 @@ impl<'a> Lower<'a> {
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             inst_at: 0,
+            builder_probe: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
@@ -2755,6 +2764,49 @@ impl<'a> Lower<'a> {
         (h, byte)
     }
 
+    /// One active lane reaching the directory sentinel wins this slice.
+    /// The record holds that lane's SSA index and both ends of the address calculation.
+    fn sample_instance(&mut self, index: V, ptr: (V, V), addr: (V, V), guard: Option<V>) {
+        let c = self.cur;
+        let k8 = self.s.m.i32(255);
+        let high = self.s.m.bin(c, Bin::And, addr.1, k8);
+        let limit = self.s.m.i32(32);
+        let past = self.s.m.cmp(c, pred::IUGE, high, limit);
+        let last_hi = self.s.m.i32(31);
+        let last_lo = self.s.m.i32(0xffff0000);
+        let hi = self.s.m.cmp(c, pred::EQ, high, last_hi);
+        let lo = self.s.m.cmp(c, pred::IUGE, addr.0, last_lo);
+        let last = self.s.m.bin(c, Bin::And, hi, lo);
+        let bad = self.s.m.bin(c, Bin::Or, past, last);
+        let active = guard.map_or(bad, |g| self.s.m.bin(c, Bin::And, g, bad));
+        let branch = self.begin_guarded(Some(active));
+        let h = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+        let base = super::shader::MEMORY_FAULTS * 4;
+        let at = self.s.m.i32(base);
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let old = self.s.op(self.cur, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79,
+            &[h, at, iu, iu, zero, one]);
+        let first = self.s.m.cmp(self.cur, pred::EQ, old, zero);
+        let winner = self.begin_guarded(Some(first));
+        let tid = self.s.op(self.cur, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let group = self.s.op(self.cur, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        for (i, value) in [index, ptr.0, ptr.1, addr.0, addr.1, tid, group].into_iter().enumerate() {
+            let byte = self.s.m.i32(base + 4 * (1 + i as u32));
+            self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140,
+                &[h, byte, iu, value, iu, iu, iu, mask, align]);
+        }
+        let done = self.s.m.i32(2);
+        self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140,
+            &[h, at, iu, done, iu, iu, iu, mask, align]);
+        self.end_guarded(winner, &[]);
+        self.end_guarded(branch, &[]);
+    }
+
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
     /// memory by address (`resource::MEMORY`): the address is the VGPR
     /// pair, each lane its own.
@@ -2782,6 +2834,7 @@ impl<'a> Lower<'a> {
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
+        let pointer = (lo, hi);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -2815,6 +2868,16 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.extract(c, r, u32::from(k));
                 let x = self.as_int(x);
                 self.write(inst, Reg::V(reg + k), x, guard);
+            }
+            if self.builder_probe && self.inst_at == 0x433c {
+                // The instance load's index is an SSA value even after v1 is reused.
+                // Only take it from the instruction defining this exact pointer.
+                let producer = self.x.p.blocks.iter().flat_map(|block| &block.insts).find(|p|
+                    p.machine.offset == 0x174 && p.write(Reg::V(17)) == inst.read(Reg::V(17))
+                    && p.write(Reg::V(18)) == inst.read(Reg::V(18)))
+                    .ok_or("F16 instance pointer changed before the global load")?;
+                let index = self.i32_of(producer.read(Reg::V(1)).ok_or("F16 record index")?)?;
+                self.sample_instance(index, pointer, (lo, hi), guard);
             }
             return Ok(());
         }
