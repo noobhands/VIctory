@@ -2713,6 +2713,14 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    // Past the console's 40-bit addresses (F16): a title buffer shaders
+    // that build addresses from 40 bits cannot reach.
+    if start >> 40 != 0 {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 40 {
+            tracing::warn!(start = format_args!("{start:#x}"), len, "a title buffer past 40 bits");
+        }
+    }
     buffers().insert(
         (start, resource),
         Entry {

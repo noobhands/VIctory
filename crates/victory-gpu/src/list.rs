@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<UploadBlock>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -187,7 +187,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Vec<UploadBlock>,
     _state: crate::draw::State,
 }
 
@@ -1417,15 +1417,54 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Some(block) = UploadBlock::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.at;
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
+}
+
+/// Memory a list hands the title ([`allocate_upload`]), given back when the
+/// list lets go of it. Below 2^40 as the console's (`crate::low`): the
+/// builder's shaders read the instance descriptions it holds by 40-bit
+/// address; a block of the host's heap lay above 1 TiB and they read
+/// garbage (F16, `f16-heap7`).
+pub(crate) struct UploadBlock {
+    at: *mut u8,
+    len: usize,
+}
+
+// SAFETY: plain memory owned by the block.
+unsafe impl Send for UploadBlock {}
+
+impl UploadBlock {
+    /// `len` zeroed bytes, 16-aligned; `None` if there are none.
+    fn new(len: usize) -> Option<UploadBlock> {
+        let at = if crate::low::on() {
+            crate::low::alloc_zeroed(len, 16)
+        } else {
+            // SAFETY: a non-zero size, 16-aligned.
+            unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(len.max(1), 16).ok()?) }
+        };
+        (!at.is_null()).then_some(UploadBlock { at, len })
+    }
+}
+
+impl Drop for UploadBlock {
+    fn drop(&mut self) {
+        if crate::low::on() {
+            // SAFETY: from `low::alloc_zeroed` with these arguments.
+            unsafe { crate::low::dealloc(self.at, self.len, 16) };
+        } else if let Ok(layout) = std::alloc::Layout::from_size_align(self.len.max(1), 16) {
+            // SAFETY: from `alloc_zeroed` with this layout.
+            unsafe { std::alloc::dealloc(self.at, layout) };
+        }
+    }
 }
 
 /// Draw state the host has no use for (root signatures: ours come with

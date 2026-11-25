@@ -192,11 +192,40 @@ pub extern "system" fn XMemVirtualAlloc(
 /// The title's own `VirtualAlloc` (from the memory API set): Windows'
 /// own, and the allocation told to the GPU side
 /// (`victory_gpu::title_memory_allocated`).
+///
+/// A new reservation (no address asked for) is made below 2^40, as on the
+/// console, whose GPU addresses are 40-bit: Windows put them above 1 TiB,
+/// and the ray-tracing builder's instance tables, written there by the
+/// title, held pointers its shaders cut to 40 bits (F16, `f16-rec1`: a
+/// root view and the record's pointer both at `0x191...`).
+/// `VICTORY_TITLE_ALLOC_LOW=0` leaves the placement to Windows.
 pub extern "system" fn title_virtual_alloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
-    // SAFETY: the title's own arguments.
-    let at = unsafe { VirtualAlloc(address, size, kind, protect) };
+    static LOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let low = *LOW.get_or_init(|| std::env::var_os("VICTORY_TITLE_ALLOC_LOW").is_none_or(|v| v != "0"));
+    let at = if address.is_null() && kind & MEM_RESERVE != 0 && low {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut c_void,
+            HighestEndingAddress: ((1usize << 40) - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: the title's own size, kind and protection; the parameter
+        // points at `requirements`, which outlives the call.
+        unsafe { VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), size, kind, protect, &mut parameter, 1) }
+    } else {
+        // SAFETY: the title's own arguments.
+        unsafe { VirtualAlloc(address, size, kind, protect) }
+    };
     if !at.is_null() {
         victory_gpu::title_memory_allocated(at as usize, size);
+    }
+    if std::env::var_os("VICTORY_XMEM_TRACE").is_some_and(|v| v == "1") {
+        static SAID: AtomicUsize = AtomicUsize::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 400 {
+            tracing::info!(at = format_args!("{at:p}"), size, kind = format_args!("{kind:#x}"), "the title's VirtualAlloc");
+        }
     }
     at
 }
@@ -329,10 +358,30 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
-    // SAFETY: the layout has a non-zero size.
-    let block = unsafe { alloc(layout) };
+    // Below 2^40 as the console's (`victory_gpu::low`; the builder's
+    // instance tables are allocated here), else from the host's heap.
+    let block = if victory_gpu::low::on() {
+        victory_gpu::low::alloc_zeroed(layout.size(), layout.align())
+    } else {
+        // SAFETY: the layout has a non-zero size.
+        unsafe { alloc(layout) }
+    };
     if block.is_null() {
         return block.cast();
+    }
+    // Diagnostics (`VICTORY_XMEM_TRACE=1`): blocks handed out past the
+    // console's 40-bit address space (F16: the ray-tracing builder's
+    // instance tables were found at such addresses).
+    if std::env::var_os("VICTORY_XMEM_TRACE").is_some_and(|v| v == "1") {
+        static SAID: AtomicUsize = AtomicUsize::new(0);
+        if (block as usize) >> 40 != 0 && SAID.fetch_add(1, Ordering::Relaxed) < 400 {
+            tracing::info!(
+                at = format_args!("{block:p}"),
+                size,
+                attributes = format_args!("{attributes:#x}"),
+                "XMemAllocDefault past 40 bits"
+            );
+        }
     }
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
@@ -359,6 +408,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if victory_gpu::low::on() {
+            victory_gpu::low::dealloc(user.sub(align), size, align);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1104,6 +1157,137 @@ fn allocation_bytes(base: usize) -> usize {
         }
         at = info.BaseAddress as usize + info.RegionSize;
     }
+}
+
+/// The C heap of a module whose allocations its GPU work reads by address
+/// (the ray-tracing structure builder's DLL builds its instance arrays
+/// with `malloc` and hands their addresses to its shaders): below 2^40 as
+/// the console's (`victory_gpu::low`). The host's C heap lay above 1 TiB
+/// and the builder's shaders cut those addresses to 40 bits (F16,
+/// `f16-low4`: root views at `0x267...`, records holding the host heap's
+/// own strings). Bound for that module alone ([`low_heap_import`]).
+const LOW_HEADER: usize = 16;
+
+/// `malloc` from the low heap: `size` bytes, 16-aligned; null if none.
+pub extern "C" fn low_malloc(size: usize) -> *mut c_void {
+    let Some(total) = size.checked_add(LOW_HEADER) else {
+        return std::ptr::null_mut();
+    };
+    let base = victory_gpu::low::alloc_zeroed(total, LOW_HEADER);
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `total` bytes of ours; the size goes in the header.
+    unsafe {
+        base.cast::<usize>().write(size);
+        base.add(LOW_HEADER).cast()
+    }
+}
+
+/// The host C runtime's own `free` and `realloc`, for blocks the low heap
+/// did not hand out (made by host DLLs, freed by the title).
+fn host_heap() -> Option<(extern "C" fn(*mut c_void), extern "C" fn(*mut c_void, usize) -> *mut c_void)> {
+    static AT: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    let (free, realloc) = (*AT.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: a loaded module and NUL-terminated names.
+        unsafe {
+            let ucrt = GetModuleHandleA(c"ucrtbase.dll".as_ptr().cast());
+            if ucrt.is_null() {
+                return None;
+            }
+            let free = GetProcAddress(ucrt, c"free".as_ptr().cast())? as usize;
+            let realloc = GetProcAddress(ucrt, c"realloc".as_ptr().cast())? as usize;
+            Some((free, realloc))
+        }
+    }))?;
+    // SAFETY: the C runtime's `free` and `realloc`, with these signatures.
+    unsafe {
+        Some((
+            std::mem::transmute::<usize, extern "C" fn(*mut c_void)>(free),
+            std::mem::transmute::<usize, extern "C" fn(*mut c_void, usize) -> *mut c_void>(realloc),
+        ))
+    }
+}
+
+/// `free` of what [`low_malloc`] gave; a block the host's heap gave goes
+/// back to it.
+pub extern "C" fn low_free(at: *mut c_void) {
+    if at.is_null() {
+        return;
+    }
+    if !victory_gpu::low::owns(at.cast()) {
+        if let Some((free, _)) = host_heap() {
+            free(at);
+        }
+        return;
+    }
+    // SAFETY: from `low_malloc`: its header is just below.
+    unsafe {
+        let base = at.cast::<u8>().sub(LOW_HEADER);
+        let size = base.cast::<usize>().read();
+        victory_gpu::low::dealloc(base, size + LOW_HEADER, LOW_HEADER);
+    }
+}
+
+/// `calloc` from the low heap (its blocks are zeroed).
+pub extern "C" fn low_calloc(n: usize, size: usize) -> *mut c_void {
+    n.checked_mul(size).map_or(std::ptr::null_mut(), |bytes| low_malloc(bytes))
+}
+
+/// `realloc` in the low heap.
+pub extern "C" fn low_realloc(at: *mut c_void, size: usize) -> *mut c_void {
+    if at.is_null() {
+        return low_malloc(size);
+    }
+    if size == 0 {
+        low_free(at);
+        return std::ptr::null_mut();
+    }
+    if !victory_gpu::low::owns(at.cast()) {
+        return host_heap().map_or(std::ptr::null_mut(), |(_, realloc)| realloc(at, size));
+    }
+    let fresh = low_malloc(size);
+    if fresh.is_null() {
+        return fresh;
+    }
+    // SAFETY: both blocks are ours; the old one's size is in its header.
+    unsafe {
+        let old = at.cast::<u8>().sub(LOW_HEADER).cast::<usize>().read();
+        std::ptr::copy_nonoverlapping(at.cast::<u8>(), fresh.cast::<u8>(), old.min(size));
+    }
+    low_free(at);
+    fresh
+}
+
+/// For a module bound with the low heap: the address of its C-heap import
+/// `name` from `dll`, if it is one of those.
+pub fn low_heap_import(dll: &str, name: &str) -> Option<usize> {
+    if !victory_gpu::low::on() || !dll.to_ascii_lowercase().starts_with("api-ms-win-crt-heap-") {
+        return None;
+    }
+    let f: usize = match name {
+        "malloc" => low_malloc as *const () as usize,
+        "free" => low_free as *const () as usize,
+        "calloc" => low_calloc as *const () as usize,
+        "realloc" => low_realloc as *const () as usize,
+        _ => return None,
+    };
+    Some(f)
+}
+
+/// Whether the module `name` gets the low heap: the console's ray-tracing
+/// structure builder.
+pub fn low_heap_module(name: &str) -> bool {
+    name.eq_ignore_ascii_case("xboxbvhbuilder.dll") || (low_heap_title() && name.to_ascii_lowercase().ends_with(".exe"))
+}
+
+/// `VICTORY_LOW_HEAP_TITLE=0`: the title's executable keeps the host's C
+/// heap (its instance descriptors for the ray-tracing builder are made
+/// there, F16).
+fn low_heap_title() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOW_HEAP_TITLE").is_none_or(|v| v != "0"))
 }
 
 pub(crate) fn module() -> HleModule {

@@ -98,10 +98,19 @@ pub fn run(
         }
     };
     for (name, dll) in &dlls {
-        show(name, dll.bind_imports(&with_dlls, policy)?);
+        // The ray-tracing builder's C heap below 2^40 (F16).
+        if victory_hle::modules::xmem::low_heap_module(name) {
+            show(name, dll.bind_imports(&LowHeap { inner: &with_dlls }, policy)?);
+        } else {
+            show(name, dll.bind_imports(&with_dlls, policy)?);
+        }
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if victory_hle::modules::xmem::low_heap_module(&exe_name) {
+        show(&exe_name, image.bind_imports(&LowHeap { inner: &with_dlls }, policy)?);
+    } else {
+        show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -245,7 +254,12 @@ impl LateDlls {
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
-                    show(name, dll.bind_imports(&resolver, self.policy)?);
+                    // The ray-tracing builder's C heap below 2^40 (F16).
+                    if victory_hle::modules::xmem::low_heap_module(name) {
+                        show(name, dll.bind_imports(&LowHeap { inner: &resolver }, self.policy)?);
+                    } else {
+                        show(name, dll.bind_imports(&resolver, self.policy)?);
+                    }
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
@@ -341,4 +355,25 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Resolves a module's C-heap imports to the heap below 2^40
+/// (`victory_hle::modules::xmem::low_heap_import`), everything else as
+/// `inner` does.
+#[cfg(windows)]
+struct LowHeap<'a> {
+    inner: &'a dyn victory_loader::ImportResolver,
+}
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for LowHeap<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        match victory_hle::modules::xmem::low_heap_import(dll, &symbol.to_string()) {
+            Some(address) => victory_loader::Resolution::Found {
+                address,
+                provenance: victory_loader::Provenance::Hle,
+            },
+            None => self.inner.resolve(dll, symbol),
+        }
+    }
 }

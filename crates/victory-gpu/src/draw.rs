@@ -481,6 +481,21 @@ impl State {
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
+        // Diagnostics (F16): who sets a root view past the console's 40-bit
+        // addresses (the return addresses on the stack, first few times).
+        #[cfg(feature = "diagnostics")]
+        if address >> 40 != 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 6 {
+                let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 16];
+                // SAFETY: room for 16 frames.
+                let n = unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(0, 16, frames.as_mut_ptr(), std::ptr::null_mut())
+                };
+                let list: Vec<String> = frames[..n as usize].iter().map(|f| format!("{:#x}", *f as usize)).collect();
+                tracing::warn!(address = format_args!("{address:#x}"), slot, compute, frames = ?list, "a root view past 40 bits set");
+            }
+        }
         set(self.roots(compute), slot, Root::View(address));
     }
 
@@ -932,6 +947,18 @@ impl State {
             // the same bytes (`shadow::find`, `VICTORY_MEMORY_IN_PLACE`).
             // Not its tables: their slots are shared with other draws.
             let _by_address = crate::shadow::ByAddress::new(t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY));
+            // Diagnostics (F16): what holds a root view past the console's
+            // 40-bit addresses, for a shader that builds addresses from 40.
+            #[cfg(feature = "diagnostics")]
+            if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                for root in self.roots_ref(compute) {
+                    if let Root::View(address) = *root
+                        && address >> 40 != 0
+                    {
+                        high_root(address, &p.name);
+                    }
+                }
+            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -2787,4 +2814,46 @@ mod tests {
         assert_eq!(super::take_mesh_drawn(), 2);
         assert_eq!(super::take_mesh_drawn(), 0);
     }
+}
+
+/// Diagnostics (F16): logs, once per allocation, what holds a root view at
+/// `address` past 40 bits (the allocation's base, size, kind, and whether
+/// it is the process heap's).
+#[cfg(feature = "diagnostics")]
+fn high_root(address: u64, pipeline: &str) {
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer; any address may be asked.
+    unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    let base = info.AllocationBase as usize;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&base) || seen.len() > 40 {
+        return;
+    }
+    seen.push(base);
+    // SAFETY: no arguments.
+    let process_heap = unsafe { GetProcessHeap() } as usize;
+    // Whether mimalloc (our own heap with `fast-alloc`) holds it.
+    #[cfg(feature = "fast-alloc")]
+    let ours = {
+        unsafe extern "C" {
+            fn mi_is_in_heap_region(p: *const std::ffi::c_void) -> bool;
+        }
+        // SAFETY: a query by address.
+        unsafe { mi_is_in_heap_region(address as *const _) }
+    };
+    #[cfg(not(feature = "fast-alloc"))]
+    let ours = false;
+    tracing::warn!(
+        address = format_args!("{address:#x}"),
+        pipeline,
+        allocation = format_args!("{base:#x}"),
+        region = format_args!("{:#x}+{:#x}", info.BaseAddress as usize, info.RegionSize),
+        kind = format_args!("{:#x}", info.Type),
+        process_heap = format_args!("{process_heap:#x}"),
+        ours_mimalloc = ours,
+        "a root view past 40 bits for a shader that builds addresses from 40"
+    );
 }

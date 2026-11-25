@@ -970,6 +970,14 @@ impl Memory {
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        // Past the console's 40-bit addresses (F16): where the title's
+        // allocator put a resource's memory.
+        if (ptr.as_ptr() as usize) >> 40 != 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                tracing::warn!(at = ?ptr, size = info.size, attributes = format_args!("{attributes:#x}"), "a resource's memory from the title's allocator lies past 40 bits");
+            }
+        }
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         Ok(Memory {
@@ -995,8 +1003,14 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
-        // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        // Below 2^40 as the console's (`crate::low`), else from our heap.
+        let ptr = if crate::low::on() {
+            crate::low::alloc_zeroed(layout.size(), layout.align())
+        } else {
+            // SAFETY: the size is non-zero.
+            unsafe { alloc_zeroed(layout) }
+        };
+        let ptr = NonNull::new(ptr).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
@@ -1015,6 +1029,8 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            // SAFETY: allocated in `new` with this layout, by the same one.
+            _ if crate::low::on() => unsafe { crate::low::dealloc(self.ptr.as_ptr(), self.layout.size(), self.layout.align()) },
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
