@@ -21,6 +21,77 @@ developer or publisher.
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The `fork-base` branch (below) builds on this fork as published
+  (`4e17478`) and adds its own changes, also developed with Claude Code.
+
+## The `fork-base` branch (2026-11-25)
+
+Changes on top of this fork, tested on a second machine: Windows 11, AMD Ryzen 9
+7900X3D, NVIDIA RTX 4080 16 GB (Resizable BAR on, PCIe 4.0 x16), 64 GB RAM,
+driver 617.42. The work log, measurements and open tickets are in
+[`docs/features/fork-base/`](docs/features/fork-base/04-tickets.md).
+
+### What works on the RTX 4080
+
+| Area | State |
+|------|-------|
+| Stability | The fork runs 6.6-7.0 minutes into the world without a device removal in every run (upstream `ffe310e` was removed after 0.7 minutes on the same machine) |
+| Opening video | Plays correctly at 30 fps again (it cycled through stale frames on this fork; see the texture fix below) |
+| Shader translation | 2,028 of 2,175 captured programs translate (the fork's own coverage); the drops left in the world are mostly the ray-tracing builder, which stays off |
+| Frame rate in the world | Still about 2 fps (520-580 ms a frame with the faster settings below); the frame is now limited by the CPU, not the GPU |
+
+### What changed
+
+- **Opening video fixed** (`texture.rs`): textures in view memory are guarded
+  read-only to learn of the title's writes, with a hash every eighth frame for
+  what the guard cannot see. The video player writes each decoded frame through
+  another view of the texture's pages, so the guard never fired and the three
+  video textures showed frames up to eight frames old in rotation. A texture
+  whose hash changes while the guard saw no write is now hashed at every check;
+  the others keep the guard.
+- **Ray-tracing builder, two of its four refused programs** (`emit/mod.rs`):
+  the wave-wide branch form (`widen`) is tried as the last resort for a program
+  every other form leaves at 64 lanes (a pipeline a 32-lane GPU refuses), so
+  `369cbe906ea72764` and `2cc4c197ee29e291` now run as 32-lane programs. The two
+  left need that form for thread groups of several console waves.
+- **Title buffers in the card's memory** (`shadow.rs`): `VICTORY_CARD_BUFFERS_MIN_KB`
+  sets the smallest buffer copied to the card in KiB. With buffers of 1 MiB and
+  more in VRAM (`VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=8192`) the
+  card's time per frame fell from 157 to 75 ms: three indirect compute dispatches
+  took 80 ms a frame reading system memory over PCIe and 1.4 ms in VRAM.
+- **Shader cache key** (`shader_cache.rs`): the view-heap index limit (a clamp
+  translated shaders carry on hosts whose view heap is capped, as NVIDIA's is) is
+  part of the key, so a cache written on another GPU is not reused without it.
+- **Committed buffers reused** (`recycle.rs`): buffers the layer lets go are handed
+  out again for requests of about their size instead of being made and released
+  in the frame (kernel trips: 163 made a frame -> 20). `VICTORY_RECYCLE=0` turns it off.
+- **mimalloc as an option** (`--features fast-alloc`): the CPU profile showed about
+  six threads in the Windows heap at once. Not on by default until repeated runs
+  show the gain.
+- **A committed page pool as an option** (`VICTORY_XMEM_COMMIT=1`, `xmem.rs`): the
+  title's physical pages made committed rather than reserved, the precondition for
+  opening them as a heap the GPU reads in place (next step, not done).
+- **Diagnostics carried over** from the investigation branch: `VICTORY_SHADER_DUMP`
+  (each shader's console container), the frame line's mesh dispatch count,
+  `VICTORY_SKIP_INDIRECT_MESH`, `VICTORY_SHADER_LOOP_EXIT` (a loop stopped by the
+  limit leaves through its exit instead of skipping the barriers after it), and the
+  most groups an indirect compute record asked for.
+
+### Faster settings measured here
+
+`VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=8192`:
+about 520-580 ms a frame in the world against 857 ms with the defaults (single
+eight-minute runs vary by about 40% with the part of the world reached).
+
+### Known problems found here
+
+- The world frame is CPU-bound: about 300 ms a frame outside submissions (the
+  title's own work and the layer's handling of its calls) and 80-470 ms of texture
+  detiling on the CPU. Next: detiling on the GPU, and title memory read in place.
+- The title builds compute dispatches of up to 115,200 groups in one dimension;
+  D3D12 allows 65,535, so those are cut short (ticket F11).
+- Everything in shadow is still black: the ray-tracing builder stays off until its
+  last two programs run on 32-lane waves (ticket F12).
 
 ## Status of this fork (2026-11-25)
 
