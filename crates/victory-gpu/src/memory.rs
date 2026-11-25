@@ -118,7 +118,11 @@ fn stride() -> usize {
     } else { 0 }
 }
 
+/// What used a slice of the faults ([`by_dispatch`]): the pipeline, and
+/// the instance table its records are sampled from (read by the
+/// diagnostics' trace only).
 #[derive(Clone)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct FaultSlice {
     who: String,
     instance_root: Option<u64>,

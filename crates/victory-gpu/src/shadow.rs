@@ -2425,6 +2425,19 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // Diagnostics (`VICTORY_ALWAYS_COPY=1`): no write watch and no
+        // guard, every refresh copies whole. Slow; it tells a picture fault
+        // that comes from a stale copy (a write the watch or the guards did
+        // not see, such as one through another view of the same pages) from
+        // one that does not.
+        #[cfg(feature = "diagnostics")]
+        {
+            static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_ALWAYS_COPY").is_some_and(|v| v == "1")) {
+                self.copy(from, to);
+                return to - from;
+            }
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);

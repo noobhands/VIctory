@@ -471,6 +471,9 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     v.views.insert(at, (len, section, offset));
     // Under the views' lock, as the directory's first walk (`with_views`).
     crate::memory::view_mapped(at, len, section, offset);
+    drop(v);
+    // The guards: every view of a guarded page is guarded with it.
+    crate::watch::view_mapped(at, len, section, offset);
 }
 
 /// The committed sections the runtime told of: handle and bytes.
@@ -535,6 +538,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let mut v = views();
     // The directory's region entries there go too (`memory::view_unmapped`).
     crate::memory::view_unmapped(at, len);
+    crate::watch::view_gone(at, len);
     if v.views.is_empty() {
         return;
     }
