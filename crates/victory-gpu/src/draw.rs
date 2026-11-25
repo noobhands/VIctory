@@ -749,7 +749,8 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        let who = || crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(String::new, |p| p.name.clone());
+        crate::memory::ready(list, heap, &addresses, &constants, writes, &who)
     }
 
     /// The bound heap holding `handle`.

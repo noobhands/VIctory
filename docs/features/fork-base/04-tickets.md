@@ -26,5 +26,5 @@ Remote ID: _(unpublished, local-first)_
 | [F13](tickets/F13-pooled-gpu-allocations.md) | GPU allocations sub-allocated from pooled heaps | F07 | — | IN PROGRESS |
 | [F14](tickets/F14-allocator-contention.md) | The process heap's lock (allocator contention) | user | — | IN PROGRESS |
 | [F15](tickets/F15-intro-video-regression.md) | The intro video flickers and zooms (regression) | — | — | DONE |
-| [F16](tickets/F16-builder-memory-coverage.md) | The builder sees all the title memory it reads (ray-traced lighting) | F12, F08 | — | TO-DO |
+| [F16](tickets/F16-builder-memory-coverage.md) | The builder sees all the title memory it reads (ray-traced lighting) | F12, F08 | — | IN PROGRESS |
 | [F17](tickets/F17-shadow-trace-programs.md) | The shadow-mask trace programs that do not translate | — | — | TO-DO |

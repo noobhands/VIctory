@@ -230,8 +230,9 @@ fn section_heap(device: &ID3D12Device, section: usize) -> Result<ID3D12Heap, Opt
     }
     let opened = open(device, From::Section(section));
     heaps.0.push((section, opened.as_ref().ok().cloned()));
-    if opened.is_ok() {
-        tracing::info!(section = format_args!("{section:#x}"), "a committed section of the title's page pool opened as one heap");
+    match &opened {
+        Ok(_) => tracing::info!(section = format_args!("{section:#x}"), "a committed section of the title's page pool opened as one heap"),
+        Err(e) => tracing::warn!(section = format_args!("{section:#x}"), error = %e, "a committed section of the title's page pool not opened as a heap"),
     }
     opened.map_err(Some)
 }
@@ -385,7 +386,65 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let mut v = views();
+    v.views.insert(at, (len, section, offset));
+    // Under the views' lock, as the directory's first walk (`with_views`).
+    crate::memory::view_mapped(at, len, section, offset);
+}
+
+/// The committed sections the runtime told of: handle and bytes.
+pub(crate) fn committed_sections() -> Vec<(usize, u64)> {
+    views().sections.iter().filter(|s| s.2).map(|s| (s.0, s.1)).collect()
+}
+
+/// A buffer over `[from, from + len)` of committed `section`, placed in
+/// the section's heap (opened on first use); `None` if the host refuses.
+///
+/// A section the host will not open whole (the title's 6.2 GB pool:
+/// E_INVALIDARG on the RTX 4080, where 710 and 185 MB sections open) is
+/// reached through a view of our own of the part, opened as a heap by
+/// address (`OpenExistingHeapFromAddress1` takes a committed view of a
+/// section). The view is ours and stays mapped for the run: the title's
+/// own views of those pages map and unmap as they please beside it.
+pub(crate) fn section_part(section: usize, from: u64, len: u64) -> Option<ID3D12Resource> {
+    let host = crate::host::host()?;
+    let placed = match section_heap(&host.device, section) {
+        Ok(heap) => place(&host.device, &heap, from, len),
+        Err(_) => view_heap(&host.device, section, from, len).and_then(|heap| place(&host.device, &heap, 0, len)),
+    };
+    match placed {
+        Ok(buffer) => Some(buffer),
+        Err(e) => {
+            tracing::warn!(section = format_args!("{section:#x}"), from, len, error = %e, "no buffer placed in a section's heap");
+            None
+        }
+    }
+}
+
+/// A view of our own of `[from, from + len)` of `section` (`from` a
+/// multiple of 64 KiB), opened as a heap; the view is never unmapped.
+fn view_heap(device: &ID3D12Device, section: usize, from: u64, len: u64) -> windows::core::Result<ID3D12Heap> {
+    // SAFETY: maps a view of a section the runtime keeps open; failing is
+    // a null address.
+    let view = unsafe {
+        mem::MapViewOfFile(section as windows_sys::Win32::Foundation::HANDLE, mem::FILE_MAP_ALL_ACCESS, (from >> 32) as u32, from as u32, len as usize)
+    };
+    if view.Value.is_null() {
+        return Err(windows::core::Error::from_thread());
+    }
+    let heap = open(device, From::Part(view.Value as usize, len as usize));
+    if heap.is_ok() {
+        tracing::info!(section = format_args!("{section:#x}"), from, len, "a part of a section opened as a heap through a view of our own");
+    }
+    heap
+}
+
+/// Calls `f` with each of the title's views (address, bytes, section,
+/// offset) under the views' lock, so that no mapping changes meanwhile;
+/// returns the sum of what `f` returned.
+pub(crate) fn with_views(mut f: impl FnMut(usize, usize, usize, u64) -> usize) -> usize {
+    let v = views();
+    v.views.iter().map(|(&at, &(len, section, offset))| f(at, len, section, offset)).sum()
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -393,6 +452,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
     let mut v = views();
+    // The directory's region entries there go too (`memory::view_unmapped`).
+    crate::memory::view_unmapped(at, len);
     if v.views.is_empty() {
         return;
     }

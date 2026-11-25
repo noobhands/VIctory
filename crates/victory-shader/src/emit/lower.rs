@@ -249,6 +249,9 @@ struct Lower<'a> {
     /// The instruction being lowered may read a lane mask as a number under
     /// `local` (a bit count, a first set bit, `v_mbcnt`).
     local_ok: bool,
+    /// The native offset of the instruction being lowered (for the
+    /// faults' record of which access found no copy, [`Self::memory`]).
+    inst_at: u32,
     /// With `local`: every mask read and lane read is taken per host wave
     /// ([`with_local_waves_any`]).
     local_any: bool,
@@ -1539,6 +1542,7 @@ impl<'a> Lower<'a> {
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
+            inst_at: 0,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
@@ -2708,13 +2712,20 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        // Pages in the first half (entries 1 to half - 1), and beside each,
+        // half further on, the native offset of the access that found it
+        // empty (which instruction computed the address).
+        let half = MEMORY_FAULTS / 2;
+        let places = k(self, half - 1);
         let place = self.s.m.bin(c, Bin::URem, page, places);
         let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
+        let beside = k(self, half * 4);
+        let beside = self.s.m.bin(c, Bin::Add, place, beside);
         let place = self.s.m.select(c, missing, place, zero);
+        let beside = self.s.m.select(c, missing, beside, zero);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
@@ -2725,6 +2736,15 @@ impl<'a> Lower<'a> {
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
+        );
+        let at = k(self, self.inst_at);
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[faults, beside, iu, at, iu, iu, iu, mask, align],
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
@@ -4806,6 +4826,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        self.inst_at = offset as u32;
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
