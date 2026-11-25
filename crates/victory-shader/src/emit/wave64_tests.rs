@@ -450,3 +450,116 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// `program()` for a group of 128 threads (two console waves, four host waves of 32): the
+/// threads below s0 take the branch, and each console wave stores its OR to dword `t >> 6`.
+fn two_wave_program(skip: u32) -> NativeProgram {
+    let mut words = vec![
+        0x2C10_0086, // v_lshrrev_b32 v8, 6, v0 (the console wave)
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8 (its dword)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5 (bit (t >> 1) & 31)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        skip | 23,   // the branch to the restore of EXEC
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0xE070_1000,
+        0x8002_0008, // buffer_store_dword v0, v8, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    native_of(&words, true, 128)
+}
+
+/// `dxc -dumpbin` text of a DXIL container (the newest Windows SDK's dxc); None without it.
+fn dumpbin(dxil: &[u8]) -> Option<String> {
+    let dxc = validator::Validator::default_path()?.with_file_name("dxc.exe");
+    if !dxc.exists() {
+        return None;
+    }
+    let file = std::env::temp_dir().join(format!("victory-wave64-{}.dxil", std::process::id()));
+    std::fs::write(&file, dxil).ok()?;
+    let out = std::process::Command::new(&dxc).arg("-dumpbin").arg(&file).output().ok()?;
+    let _ = std::fs::remove_file(&file);
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A group of two console waves with the branch taken wave-wide: each console wave decides
+/// the branch for itself, so the two host waves of a console wave meet through their own
+/// arrival counters (polled with compare-exchanges), never through a group barrier, which
+/// would wait for the other console wave's threads that took the other path. Only the
+/// entry block's meeting (`wave_base`, which every thread runs) stays a group barrier.
+#[test]
+fn two_console_waves_meet_pair_by_pair_inside_a_wave_wide_branch() {
+    let (skip, name) = (0xBF88_0000, "s_cbranch_execz");
+    let native = two_wave_program(skip);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == name))
+        .expect("the branch");
+    let wide = HashSet::from([branch]);
+    let shader = lowered(&native, &p, &wide).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Some(text) = dumpbin(&shader.dxil) else {
+        eprintln!("no Windows SDK dxc.exe; not checked or run");
+        return;
+    };
+    // barrier modes: 1 waits for the group; 8 fences shared memory. Only the entry block
+    // (before the first label), which every thread runs, may wait for the group.
+    let body = text.split("define void @main()").nth(1).expect("main");
+    let after_entry = body.split_once("; <label>:").map_or("", |(_, rest)| rest);
+    let waits = |s: &str| {
+        s.lines()
+            .filter(|l| l.contains("@dx.op.barrier(i32 80, i32 ") && !l.contains("@dx.op.barrier(i32 80, i32 8)"))
+            .count()
+    };
+    assert!(waits(body) > 0, "the entry block's meetings wait for the group:\n{text}");
+    assert_eq!(waits(after_entry), 0, "no group barrier past the entry block:\n{text}");
+    assert!(after_entry.contains("cmpxchg"), "inside the branch the halves poll their arrival counters:\n{text}");
+    // LDS starts with what an earlier group left (D3D12 does not clear it): the entry block
+    // zeroes the pairs' counters before any meeting
+    let entry = body.split_once("; <label>:").map_or(body, |(head, _)| head);
+    assert!(
+        entry.lines().any(|l| l.contains("store i32 0, i32 addrspace(3)*")),
+        "the entry block zeroes the pair records:\n{text}"
+    );
+    // On a GPU that takes waves of 32: each console wave's OR of its threads below s0, and
+    // nothing from a console wave none of whose threads take the branch.
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program (waves of 32?); not run");
+        return;
+    };
+    for (below, expected) in [(128u32, [u32::MAX, u32::MAX]), (100, [u32::MAX, 0x3FFFF]), (70, [u32::MAX, 0x7]), (40, [0xF_FFFF, 0])] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!([out[0][0], out[0][1]], expected, "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: each console wave's OR, the halves meeting pair by pair");
+}

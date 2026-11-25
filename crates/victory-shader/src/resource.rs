@@ -561,6 +561,24 @@ impl<'a> Tracer<'a> {
         self.origin[v.0 as usize]
     }
 
+    /// Whether `t` cannot hold a descriptor the tracking missed: a constant, a register as
+    /// the program got it (no instruction writes it, no join makes it: user data, system
+    /// values), or one an instruction other than a memory load wrote (a lane mask, an ALU
+    /// result). A load or a join could hold one by a way not followed here. Returns true for
+    /// those that cannot.
+    fn as_got(&self, t: &Term) -> bool {
+        match *t {
+            Term::Const(_) => true,
+            Term::Value(v) => {
+                self.phis[v.0 as usize].is_none()
+                    && self.def(v).is_none_or(|i| {
+                        let n = i.name();
+                        !(n.starts_with("s_load") || n.starts_with("s_buffer_load") || n.starts_with("s_scratch_load"))
+                    })
+            }
+        }
+    }
+
     /// The origin of a one-dword operand as `inst` reads it.
     fn term(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
@@ -1340,7 +1358,27 @@ impl<'a> Tracer<'a> {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
-                None => Err(e),
+                // Else, one edge that loads or builds a descriptor while on every other the
+                // registers hold what cannot be one ([`Self::as_got`]: a skip taken wave-wide
+                // over code that builds a sampler in registers that held lane masks before,
+                // `2da4beb386509b77`): no descriptor was made on those edges, and the one
+                // made is the descriptor.
+                None => {
+                    let preds = self.p.blocks[block].preds.len();
+                    let mut made = Vec::new();
+                    let mut none = 0;
+                    for j in 0..preds {
+                        match self.classify(&edge(j), joins, known) {
+                            Ok(source) => made.push(source),
+                            Err(_) if edge(j).iter().all(|w| self.as_got(w)) => none += 1,
+                            Err(_) => {}
+                        }
+                    }
+                    match made.as_slice() {
+                        [one] if none > 0 && none + 1 == preds && self.anywhere(one) => Ok(one.clone()),
+                        _ => Err(e),
+                    }
+                }
             },
         };
         joins.pop();
@@ -2410,6 +2448,45 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    /// A sampler built from constants in a branch that skips code when no lane is left for it,
+    /// over the registers that held the program's root constants, and used after the join by
+    /// every lane (the ray-tracing builder's `2da4beb386509b77` at 0x4ac-0x4d0). With the
+    /// branch taken wave-wide, a wave can come to the sample by the skip, where those
+    /// registers still hold what the program got and no descriptor was ever written: the
+    /// sampler is the one the other edge builds.
+    #[test]
+    fn a_sampler_built_in_a_wave_wide_skip_over_input_registers_is_the_built_one() {
+        let words = [
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF40C_0604,
+            0xFA00_0000, // s_load_dwordx8 s[24:31], s[8:9], 0
+            0x7D88_0004, // v_cmp_gt_u32 vcc, s4, v0
+            0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+            0xBF88_0005, // s_cbranch_execz past the sampler
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF090_010A,
+            0x0006_0F07,
+            0x0000_1608, // image_sample_l v15, [v7, v8, v22], s[24:31], s[0:3]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let branch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("the branch");
+        let st = crate::structure::structure_wide(&p, &std::collections::HashSet::from([branch])).expect("structure");
+        let layout = [param(Constants, 0, 5), param(Table, 8, 1)];
+        let r = track(&p, &layout, HwStage::Cs, Some(&st)).expect("tracked");
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).expect("the sampler");
+        assert_eq!(sampler.source, Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0]));
     }
 
     #[test]

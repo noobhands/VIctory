@@ -387,6 +387,36 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Moves what `block` holds so far (its phis and body) into a new block, which takes its
+    /// place as the target of every branch into `block`; `block` stays, empty and without a
+    /// terminator, to go on after code put between the two (a loop the lowering adds in the
+    /// middle of a block). A phi that names `block` as where an edge comes from keeps naming
+    /// it: the code before that edge still ends there. Not for a function's entry block.
+    /// Returns the new block.
+    pub fn split_front(&mut self, block: usize) -> usize {
+        let front = self.new_block();
+        self.blocks[front].phis = std::mem::take(&mut self.blocks[block].phis);
+        self.blocks[front].body = std::mem::take(&mut self.blocks[block].body);
+        for (i, b) in self.blocks.iter_mut().enumerate() {
+            if i == front {
+                continue;
+            }
+            match &mut b.term {
+                Some(Term::Br(t)) if *t == block => *t = front,
+                Some(Term::CondBr(_, t, f)) => {
+                    if *t == block {
+                        *t = front;
+                    }
+                    if *f == block {
+                        *f = front;
+                    }
+                }
+                _ => {}
+            }
+        }
+        front
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -1041,6 +1071,26 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block split for a loop between its two parts: what it held moves to the front
+    /// block, branches into it go to the front, and it stays, empty, to go on after.
+    #[test]
+    fn a_split_block_keeps_its_end_and_gives_its_start_away() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (a, b) = (m.new_block(), m.new_block());
+        m.terminate(a, Term::Br(b));
+        let phi = m.phi(b, i32t);
+        let one = m.i32(1);
+        let sum = m.bin(b, Bin::Add, phi, one);
+        let front = m.split_front(b);
+        let (V::Inst(phi), V::Inst(sum)) = (phi, sum) else { panic!("instructions") };
+        assert!(matches!(m.blocks[a].term, Some(Term::Br(t)) if t == front), "the branch into it goes to the front");
+        assert_eq!(m.blocks[front].phis, vec![phi]);
+        assert_eq!(m.blocks[front].body, vec![sum]);
+        assert!(m.blocks[b].phis.is_empty() && m.blocks[b].body.is_empty());
+        assert!(m.blocks[b].term.is_none(), "it goes on after what comes between");
+    }
 
     #[test]
     fn vbr_and_blocks() {
