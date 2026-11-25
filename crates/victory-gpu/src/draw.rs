@@ -294,6 +294,22 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
+/// Direct mesh dispatches (`DispatchMesh`) run on the host since the last
+/// [`take_mesh_drawn`] (they count among [`drawn`] too). Indirect ones
+/// (`ExecuteIndirect` of mesh records) are counted with the other indirect
+/// executions, not here.
+static MESH_DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a direct mesh dispatch run on the host.
+fn count_mesh_drawn() {
+    MESH_DRAWN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mesh dispatches run on the host since the last call (for the frame line).
+pub(crate) fn take_mesh_drawn() -> u64 {
+    MESH_DRAWN.swap(0, Ordering::Relaxed)
+}
+
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
@@ -1814,6 +1830,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    count_mesh_drawn();
                     true
                 }
                 Err(_) => false,
@@ -2283,6 +2300,14 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
+        if kind == MESH {
+            static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *SKIP.get_or_init(|| std::env::var_os("VICTORY_SKIP_INDIRECT_MESH").is_some()) {
+                once!("VICTORY_SKIP_INDIRECT_MESH: dropping indirect mesh before the argument clamp");
+                return false;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
@@ -2689,4 +2714,18 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    /// Mesh dispatches run on the host are counted apart from the other
+    /// draws, and each frame line takes the ones since the last.
+    #[test]
+    fn mesh_dispatches_are_counted_per_frame_line() {
+        super::take_mesh_drawn();
+        super::count_mesh_drawn();
+        super::count_mesh_drawn();
+        assert_eq!(super::take_mesh_drawn(), 2);
+        assert_eq!(super::take_mesh_drawn(), 0);
+    }
 }

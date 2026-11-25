@@ -295,6 +295,10 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Diagnostics ([`super::loop_exit`]): edges added from a latch's DXIL
+    /// block to its loop's exit (IR block), which the exit's phis take
+    /// zeros from.
+    limit_exits: Vec<(usize, usize)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1551,6 +1555,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            limit_exits: Vec::new(),
         }
     }
 
@@ -10431,8 +10436,11 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let stop = match self.limit_exit(b, t) {
+                    Some(e) => e,
+                    None => self.abort_block(),
+                };
+                Term::CondBr(ok, self.block[t].expect("reachable"), stop)
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -10555,6 +10563,22 @@ impl<'a> Lower<'a> {
         over
     }
 
+    /// Diagnostics ([`super::loop_exit`]): the DXIL block a lane stopped by
+    /// [`LOOP_LIMIT`] at the unconditional back edge `latch` -> `header`
+    /// goes to instead of leaving the program, the loop's one exit
+    /// ([`single_loop_exit`]); the edge is recorded for the exit's phis.
+    /// None with the switch off, in a pixel program, or without one exit.
+    fn limit_exit(&mut self, latch: usize, header: usize) -> Option<usize> {
+        if !super::loop_exit() || self.s.pixel {
+            return None;
+        }
+        let succs = lane_successors(self.x.st);
+        let exit = single_loop_exit(&succs, header, latch)?;
+        let target = self.block[exit]?;
+        self.limit_exits.push((self.cur, exit));
+        Some(target)
+    }
+
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
@@ -10608,6 +10632,9 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
+            }
+            for &(from, _) in self.limit_exits.iter().filter(|&&(_, e)| e == b) {
+                incoming.push((self.s.m.bool(false), from));
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -10727,12 +10754,85 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
+            for &(from, _) in self.limit_exits.iter().filter(|&&(_, e)| e == b) {
+                let zero = if bit {
+                    self.s.m.bool(false)
+                } else {
+                    self.s.m.i32(0)
+                };
+                incoming.push((zero, from));
+            }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+        for (header, (phi, mut incoming)) in std::mem::take(&mut self.counters) {
+            for &(from, _) in self.limit_exits.iter().filter(|&&(_, e)| e == header) {
+                incoming.push((self.s.m.i32(0), from));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         Ok(())
+    }
+}
+
+/// Each IR block's successors as a lane leaves it.
+fn lane_successors(st: &Structured) -> Vec<Vec<usize>> {
+    st.exits
+        .iter()
+        .map(|e| match *e {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        })
+        .collect()
+}
+
+/// The one block a loop is left to for good, if it has exactly one: the
+/// natural loop of back edge `latch` -> `header` is the header plus every
+/// block reaching the latch without passing the header; its exits are the
+/// blocks outside it that a block inside it goes to, less those that come
+/// back to the header (structurisation's node-split copies of the loop).
+/// `succs` is each block's successors (as from [`lane_successors`]). None
+/// with no such exit or several.
+fn single_loop_exit(succs: &[Vec<usize>], header: usize, latch: usize) -> Option<usize> {
+    let mut preds = vec![Vec::new(); succs.len()];
+    for (b, s) in succs.iter().enumerate() {
+        for &t in s {
+            preds[t].push(b);
+        }
+    }
+    let mut body = HashSet::from([header]);
+    let mut work = vec![latch];
+    while let Some(b) = work.pop() {
+        if body.insert(b) {
+            work.extend(preds[b].iter().copied());
+        }
+    }
+    let mut exits: Vec<usize> = body
+        .iter()
+        .flat_map(|&b| succs[b].iter().copied())
+        .filter(|t| !body.contains(t))
+        .collect();
+    exits.sort_unstable();
+    exits.dedup();
+    let comes_back = |from: usize| {
+        let mut seen = HashSet::new();
+        let mut work = vec![from];
+        while let Some(b) = work.pop() {
+            if b == header {
+                return true;
+            }
+            if seen.insert(b) {
+                work.extend(succs[b].iter().copied());
+            }
+        }
+        false
+    };
+    exits.retain(|&t| !comes_back(t));
+    match exits[..] {
+        [e] => Some(e),
+        _ => None,
     }
 }
 
@@ -10752,7 +10852,28 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, single_loop_exit};
+
+    /// A loop left only from its header has that one exit, also when the
+    /// body has several blocks; two ways out (or none) give no single exit.
+    /// A way out that comes back to the header (a node-split copy of the
+    /// loop) does not count as leaving it.
+    #[test]
+    fn a_loop_has_a_single_exit_only_when_one_block_is_left_to() {
+        // 1 -> 2 | 4; 2 -> 3 | 5; 3 -> 1 (back edge); 5 -> 1 comes back; 4 ends.
+        let split = [vec![1], vec![2, 4], vec![3, 5], vec![1], vec![], vec![1]];
+        assert_eq!(single_loop_exit(&split, 1, 3), Some(4));
+        // 0 -> 1; 1 -> 2 | 3; 2 -> 1 (back edge); 3 ends.
+        assert_eq!(single_loop_exit(&[vec![1], vec![2, 3], vec![1], vec![]], 1, 2), Some(3));
+        // A body of 1, 2, 3 with the latch 3; 1 is left to 4.
+        let longer = [vec![1], vec![2, 4], vec![3], vec![1], vec![]];
+        assert_eq!(single_loop_exit(&longer, 1, 3), Some(4));
+        // The latch also leaves to 4: two exits.
+        let two = [vec![1], vec![2, 3], vec![1, 4], vec![], vec![]];
+        assert_eq!(single_loop_exit(&two, 1, 2), None);
+        // An endless loop: no exit.
+        assert_eq!(single_loop_exit(&[vec![1], vec![2], vec![1]], 1, 2), None);
+    }
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };

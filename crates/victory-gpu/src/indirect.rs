@@ -74,10 +74,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 asked = src_args.Load3(src_at);
+        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
+        bool limited = any(asked > uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
+            limited = true;
+        }
+        // Diagnostics, in the budget buffer's words 3 and 4: the most
+        // groups a compute record asked for (the product, saturated), and
+        // how many records asked for more than a dispatch runs.
+        uint total = asked.x;
+        total = (asked.y != 0 && total > 0xFFFFFFFFu / asked.y) ? 0xFFFFFFFFu : total * asked.y;
+        total = (asked.z != 0 && total > 0xFFFFFFFFu / asked.z) ? 0xFFFFFFFFu : total * asked.z;
+        uint was;
+        budget.InterlockedMax(12, total, was);
+        if (limited) {
+            budget.InterlockedAdd(16, 1u, was);
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;

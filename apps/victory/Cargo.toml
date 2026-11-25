@@ -29,6 +29,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# mimalloc as the process's allocator (victory-gpu `fast-alloc`, F14).
+fast-alloc = ["victory-hle/fast-alloc"]
 
 [lints]
 workspace = true

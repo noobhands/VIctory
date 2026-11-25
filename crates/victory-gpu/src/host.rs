@@ -406,6 +406,10 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Buffers made by the three helpers since the last frame line (against
+/// those handed out again by `crate::recycle`).
+pub(crate) static MADE_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -1215,6 +1219,11 @@ pub(crate) fn dred_on() -> bool {
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Indirect compute dispatches since the last frame line: the most groups
+/// a record asked for (saturated at 2^32 - 1), and how many records asked
+/// for more than a dispatch runs (from the lists' budget buffers, a run late).
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -4996,13 +5005,18 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // asked for, the groups asked in all; compute dispatches: the
+            // most groups a record asked for, the records over the limit):
+            // taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (asked, over) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                COMPUTE_GROUPS[0].fetch_max(u64::from(asked), Ordering::Relaxed);
+                COMPUTE_GROUPS[1].fetch_add(u64::from(over), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -5537,7 +5551,11 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some((buffer, data)) = crate::recycle::take(crate::recycle::Kind::Upload, size.max(1)) {
+            return Some((buffer, data as *mut u8));
+        }
         MADE[0].fetch_add(1, Ordering::Relaxed);
+        MADE_SINCE.fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
@@ -5575,7 +5593,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::recycle::gives(crate::recycle::Kind::Upload, &buffer, data as usize, size.max(1));
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -5659,6 +5681,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        let mesh = crate::draw::take_mesh_drawn() as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -5678,6 +5701,15 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
+        let compute_over = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!(
+            "indirect compute dispatches: the most groups a record asked for {compute_largest} (run: at most 1048576), {compute_over:.1} records a frame over the limit"
+        );
+        let reused = crate::recycle::REUSED[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let reused_mb = crate::recycle::REUSED[1].swap(0, Ordering::Relaxed) as f64 / frames / 1e6;
+        let made = MADE_SINCE.swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!("buffers per frame: {made:.1} made, {reused:.1} handed out again ({reused_mb:.1} MB; VICTORY_RECYCLE=0 turns that off)");
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
@@ -5792,7 +5824,7 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame ({mesh:.0} mesh), \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
@@ -6100,7 +6132,11 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some((buffer, data)) = crate::recycle::take(crate::recycle::Kind::Shared, size.max(1)) {
+            return Some((buffer, data as *mut u8));
+        }
         MADE[2].fetch_add(1, Ordering::Relaxed);
+        MADE_SINCE.fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -6141,7 +6177,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::recycle::gives(crate::recycle::Kind::Shared, &buffer, data as usize, size.max(1));
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -6152,7 +6192,11 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if let Some((buffer, _)) = crate::recycle::take(crate::recycle::Kind::Card, size.max(1)) {
+            return Some(buffer);
+        }
         MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE_SINCE.fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -6185,7 +6229,11 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::recycle::gives(crate::recycle::Kind::Card, &buffer, 0, size.max(1));
+                Some(buffer)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

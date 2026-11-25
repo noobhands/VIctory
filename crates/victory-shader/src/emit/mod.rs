@@ -115,7 +115,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -187,6 +187,22 @@ pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
+
+/// Diagnostics: whether `VICTORY_SHADER_LOOP_EXIT` is set, which makes a
+/// lane stopped by the loop limit ([`loop_limit`]) at an unconditional back
+/// edge leave the loop through its one exit instead of leaving the program
+/// (pixel programs keep discarding). A lane that leaves the program skips
+/// the group barriers after the loop, which the group's other threads then
+/// wait at forever; this tells that hang from a loop that is merely long.
+/// The lane's loop-carried values at the exit are zero. Off in other
+/// builds; part of the translation, so the shader cache keys on it.
+pub fn loop_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_SHADER_LOOP_EXIT").is_some()
+    })
+}
+
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
@@ -458,6 +474,28 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last resort, for a program every form above leaves at 64 lanes (a pipeline a
+        // 32-lane host refuses, its work dropped): the wave-wide branches ([`widen`]).
+        // Earlier in the order only with `VICTORY_WAVE_WIDE=1`: there it took programs
+        // another form ran (`ptfx_CS_lightAtlas_Sprite` / `_Trail`), which then hung the
+        // card; here it takes only programs nothing else runs (the ray-tracing builder's
+        // `369cbe906ea72764`, `2cc4c197ee29e291`). `VICTORY_WAVE_WIDE=0` turns it off.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }

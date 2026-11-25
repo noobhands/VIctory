@@ -37,12 +37,56 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// The switches that pick the form of a wave64 program: without them in
+/// the key a run with `VICTORY_WAVE_WIDE=0` was served the translations an
+/// earlier run of the same executable had cached with the switch unset.
+const FORM_SWITCHES: [&str; 4] = [
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_F16_NEAREST",
+];
+
+/// The translation settings a build runs with, as key bytes. Inputs: the
+/// loop limit; which group barriers wait (`group_sync`); each form switch
+/// with its value (None: unset); which clean-up passes run
+/// (`shader_opt`); the view index limit of a capped host heap (0: none);
+/// whether a loop stopped by the limit is left through its exit
+/// (`loop_exit`, diagnostics). Returns the bytes appended to the
+/// executable's before hashing.
+fn settings(
+    loop_limit: u32,
+    group_sync: u8,
+    switches: &[(&str, Option<std::ffi::OsString>)],
+    shader_opt: u32,
+    view_limit: u32,
+    loop_exit: bool,
+) -> Vec<u8> {
+    let mut bytes = loop_limit.to_le_bytes().to_vec();
+    bytes.push(group_sync);
+    for (name, value) in switches {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = value {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&shader_opt.to_le_bytes());
+    // A shader translated with a view limit clamps its heap indices
+    // (`set_view_heap_limit`); one translated without does not.
+    bytes.extend_from_slice(&view_limit.to_le_bytes());
+    bytes.push(u8::from(loop_exit));
+    bytes
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation [`settings`] it runs with.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        // The view limit is part of the key: known before the first key.
+        crate::descriptor::host::probe_view_limit();
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -51,30 +95,26 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let loop_exit = victory_shader::emit::loop_exit();
+        if loop_exit {
+            tracing::warn!(
+                "VICTORY_SHADER_LOOP_EXIT: a loop stopped by the limit is left through its exit"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                let switches: Vec<(&str, Option<std::ffi::OsString>)> = FORM_SWITCHES
+                    .iter()
+                    .map(|&name| (name, std::env::var_os(name)))
+                    .collect();
+                bytes.extend(settings(
+                    limit,
+                    victory_shader::emit::group_sync(),
+                    &switches,
+                    victory_shader::emit::shader_opt(),
+                    victory_shader::emit::view_heap_limit(),
+                    loop_exit,
+                ));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -328,6 +368,23 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every translation setting is in the cache key: among them the view
+    /// limit of a capped host heap, without which a cache written on a host
+    /// that holds every view would serve unclamped shaders to NVIDIA.
+    #[test]
+    fn each_translation_setting_changes_the_key() {
+        let unset = [("VICTORY_WAVE_WIDE", None)];
+        let base = settings(1 << 20, 0, &unset, 1, 0, false);
+        assert_eq!(base, settings(1 << 20, 0, &unset, 1, 0, false), "the same settings, the same key");
+        assert_ne!(base, settings(64, 0, &unset, 1, 0, false), "loop limit");
+        assert_ne!(base, settings(1 << 20, 1, &unset, 1, 0, false), "group sync");
+        let wide = [("VICTORY_WAVE_WIDE", Some(std::ffi::OsString::from("1")))];
+        assert_ne!(base, settings(1 << 20, 0, &wide, 1, 0, false), "a wave switch");
+        assert_ne!(base, settings(1 << 20, 0, &unset, 0, 0, false), "clean-up passes");
+        assert_ne!(base, settings(1 << 20, 0, &unset, 1, 999_999, false), "view limit");
+        assert_ne!(base, settings(1 << 20, 0, &unset, 1, 0, true), "loop exit");
+    }
 
     fn shader() -> HostShader {
         HostShader {

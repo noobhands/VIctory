@@ -145,14 +145,33 @@ pub(crate) fn cards() -> bool {
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_KB` sets the smallest such buffer in KiB
+/// instead (at least one 64 KiB piece): with the default floor the small
+/// copies stay in system memory, where every shader access crosses PCIe
+/// (RTX 4080: three indirect dispatches took 80 ms a frame there and 1.4
+/// ms in the card's memory, F07).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let var = |name: &str| std::env::var(name).ok();
+        card_limits_from(
+            var("VICTORY_CARD_BUFFERS_MIN_MB").as_deref(),
+            var("VICTORY_CARD_BUFFERS_MIN_KB").as_deref(),
+            var("VICTORY_CARD_BUFFERS_MB").as_deref(),
+        )
     })
+}
+
+/// [`card_limits`] from the switches' values: the floor in MiB (default
+/// 16, at least 1 MiB) unless a readable floor in KiB is given (at least
+/// [`PIECE`]), and the total in MiB (default 512). Returns bytes.
+fn card_limits_from(min_mb: Option<&str>, min_kb: Option<&str>, total_mb: Option<&str>) -> (u64, u64) {
+    let read = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    let floor = match read(min_kb) {
+        Some(kb) => (kb << 10).max(PIECE as u64),
+        None => (read(min_mb).unwrap_or(16) << 20).max(1 << 20),
+    };
+    (floor, read(total_mb).unwrap_or(512) << 20)
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -385,6 +404,23 @@ fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
 fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
     let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
     (lo.max(span.from as usize), hi.min(span.to as usize))
+}
+
+#[cfg(test)]
+mod card_limit_tests {
+    use super::card_limits_from;
+
+    /// The defaults; the floor in MiB (at least 1 MiB); a floor in KiB
+    /// that wins over it (at least 64 KiB, the piece); the total in MiB.
+    #[test]
+    fn card_limits_take_a_floor_in_kib_over_mib() {
+        assert_eq!(card_limits_from(None, None, None), (16 << 20, 512 << 20));
+        assert_eq!(card_limits_from(Some("0"), None, None).0, 1 << 20, "MiB floor at least 1 MiB");
+        assert_eq!(card_limits_from(Some("4"), None, Some("8192")), (4 << 20, 8192 << 20));
+        assert_eq!(card_limits_from(Some("4"), Some("256"), None).0, 256 << 10, "KiB wins");
+        assert_eq!(card_limits_from(None, Some("1"), None).0, 64 << 10, "KiB floor at least a piece");
+        assert_eq!(card_limits_from(None, Some("x"), None).0, 16 << 20, "unreadable: ignored");
+    }
 }
 
 #[cfg(test)]

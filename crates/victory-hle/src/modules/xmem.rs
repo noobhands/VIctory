@@ -47,6 +47,25 @@ pub(crate) fn on_wine() -> bool {
     *WINE
 }
 
+/// Whether the title's physical page pool is made committed (`SEC_COMMIT`)
+/// instead of reserved: under Wine always (see `XMemAllocatePhysicalPages`),
+/// and on Windows with `VICTORY_XMEM_COMMIT=1`. A committed section is
+/// what Direct3D can open as a heap the GPU reads in place
+/// (`OpenExistingHeapFromFileMapping`; `victory_gpu::inplace`); it takes
+/// its whole size from the commit limit at once (the title asks for about
+/// 6.1 GiB), which a PC with room to spare can give.
+fn committed_pool(wine: bool, switch: Option<&std::ffi::OsStr>) -> bool {
+    wine || switch.is_some_and(|v| v == "1")
+}
+
+/// [`committed_pool`] for this process (read once).
+fn pool_committed() -> bool {
+    static COMMITTED: LazyLock<bool> = LazyLock::new(|| {
+        committed_pool(on_wine(), std::env::var_os("VICTORY_XMEM_COMMIT").as_deref())
+    });
+    *COMMITTED
+}
+
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -410,7 +429,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if pool_committed() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -430,7 +449,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, pool_committed());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -746,8 +765,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if pool_committed() {
+        return true; // sections are committed whole then
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -950,6 +969,18 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page pool is committed under Wine, and on Windows only with
+    /// `VICTORY_XMEM_COMMIT=1`.
+    #[test]
+    fn the_page_pool_is_committed_under_wine_or_when_asked() {
+        let one = std::ffi::OsStr::new("1");
+        let zero = std::ffi::OsStr::new("0");
+        assert!(committed_pool(true, None), "Wine");
+        assert!(committed_pool(false, Some(one)), "asked for");
+        assert!(!committed_pool(false, None), "unset");
+        assert!(!committed_pool(false, Some(zero)), "0");
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

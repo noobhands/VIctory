@@ -49,6 +49,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod recycle;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
@@ -64,3 +66,9 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
 };
+
+/// mimalloc as the process's allocator in builds without diagnostics (which
+/// count every block on top of it, `copystat`): the `fast-alloc` feature.
+#[cfg(all(feature = "fast-alloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

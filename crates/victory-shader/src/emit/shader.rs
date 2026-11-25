@@ -124,6 +124,12 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The view index limit translations take now ([`VIEW_LIMIT`]; 0: none).
+/// Part of the translation: the shader cache keys on it.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

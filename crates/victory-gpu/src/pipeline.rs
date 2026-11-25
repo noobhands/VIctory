@@ -135,6 +135,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                dump(self);
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -170,6 +172,34 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+/// Diagnostics: with `VICTORY_SHADER_DUMP=<dir>`, the console container of
+/// each shader translated is written there ([`dump_to`]), for `victory
+/// translate` and offline study.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump(shader: &Shader) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_SHADER_DUMP").map(Into::into))
+    else {
+        return;
+    };
+    if let Err(e) = dump_to(dir, shader) {
+        tracing::warn!(error = %e, dir = %dir.display(), hash = %shader.hash, "shader not dumped");
+    }
+}
+
+/// Writes `shader`'s console container to `<dir>/<hash>.<stage>.bin` (the
+/// hash the pipeline logs print), creating `dir`; refuses a `dir` inside
+/// the repository, since a dump is game data (docs/asset-policy.md).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_to(dir: &std::path::Path, shader: &Shader) -> std::io::Result<()> {
+    victory_core::ensure_outside_repo(dir).map_err(std::io::Error::other)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join(format!("{}.{}.bin", shader.hash, shader.stage)),
+        &shader.container,
+    )
 }
 
 #[cfg(windows)]
@@ -732,6 +762,33 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// `VICTORY_SHADER_DUMP`: a shader's console container is written as
+    /// `<hash>.<stage>.bin`, the hash the pipeline logs print, creating
+    /// the folder.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn shader_dumps_are_named_by_hash_and_stage() {
+        let dir = std::env::temp_dir().join(format!("victory-dump-{}", std::process::id()));
+        let s = super::shader("mesh", &[7, 8, 9, 10]);
+        super::dump_to(&dir, &s).unwrap();
+        let file = dir.join(format!("{}.mesh.bin", s.hash));
+        assert_eq!(std::fs::read(&file).unwrap(), [7, 8, 9, 10]);
+        assert_eq!(s.hash.len(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shader dumps are game data (docs/asset-policy.md): a folder inside
+    /// the repository is refused and nothing is written there.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn shader_dumps_are_refused_inside_the_repository() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("victory-dump-inside-{}", std::process::id()));
+        let s = super::shader("pixel", &[1, 2, 3]);
+        assert!(super::dump_to(&dir, &s).is_err());
+        assert!(!dir.exists());
     }
 
     use super::*;

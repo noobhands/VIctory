@@ -66,6 +66,28 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Found written through another view of its pages: the hash changed
+    /// while the guard saw no write ([`written_elsewhere`]); hashed at
+    /// every check from then on ([`hash_skipped`]).
+    aliased: bool,
+}
+
+/// Whether a guarded texture's hash is skipped at a check: the guard saw it
+/// unwritten (`unwritten`), it is not its turn of the hash every eighth
+/// frame (`turn`), and it was never found written through another view
+/// (`aliased`). Returns true to skip.
+fn hash_skipped(unwritten: bool, turn: bool, aliased: bool) -> bool {
+    unwritten && !turn && !aliased
+}
+
+/// Whether a texture counts as written through another view of its pages
+/// after a hash: it did already (`was`), or the hash changed (`changed`)
+/// while the guard saw it unwritten (`unwritten`). The intro video
+/// (Bink) writes each frame into one of three textures through another
+/// view: with the hash every eighth frame only, each showed a frame up to
+/// eight frames old and the screen cycled through stale ones (F15).
+fn written_elsewhere(unwritten: bool, changed: bool, was: bool) -> bool {
+    was || (unwritten && changed)
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -647,6 +669,9 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // The guard saw no write since the last check (a change the hash
+        // finds anyway was made through another view).
+        let mut quiet = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -654,9 +679,10 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if hash_skipped(unwritten, turn, last.aliased) {
                 return 0;
             }
+            quiet = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -696,6 +722,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
+                last.aliased = written_elsewhere(quiet, last.hash.is_some(), last.aliased);
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
@@ -718,6 +745,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                last.aliased = written_elsewhere(quiet, last.hash.is_some(), last.aliased);
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -734,6 +762,7 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
+        last.aliased = written_elsewhere(quiet, last.hash.is_some(), last.aliased);
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
@@ -1053,6 +1082,26 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::{hash_skipped, written_elsewhere};
+
+    /// A guarded texture the guard saw unwritten is not hashed, but on its
+    /// turn; one found written through another view is hashed every check.
+    #[test]
+    fn a_texture_written_through_another_view_is_hashed_at_every_check() {
+        assert!(hash_skipped(true, false, false), "unwritten, not its turn");
+        assert!(!hash_skipped(true, true, false), "its turn");
+        assert!(!hash_skipped(false, false, false), "the guard saw a write");
+        assert!(!hash_skipped(true, false, true), "aliased: every check");
+        // The hash found a change the guard did not see: written elsewhere.
+        assert!(written_elsewhere(true, true, false));
+        assert!(!written_elsewhere(false, true, false), "the guard saw it");
+        assert!(!written_elsewhere(true, false, false), "nothing changed");
+        assert!(written_elsewhere(false, false, true), "stays aliased");
+    }
 }
 
 #[cfg(test)]
