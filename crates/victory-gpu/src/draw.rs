@@ -1727,6 +1727,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        if crate::storetrace::on() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::storetrace::note(&format!("B {}", self.op_text(format!("dispatch {x}x{y}x{z}"), true)));
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2468,6 +2472,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if crate::storetrace::on() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::storetrace::note(&format!(
+                "B {}",
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            ));
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }

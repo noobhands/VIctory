@@ -22,7 +22,8 @@ Remote ID: _(unpublished, local-first)_
 | [F09](tickets/F09-gpu-hotspots.md) | GPU time hotspots | F07 | — | TO-DO |
 | [F10](tickets/F10-texture-path.md) | Texture uploads and detiling | F07 | — | TO-DO |
 | [F11](tickets/F11-large-dispatches.md) | Dispatches of more than 65,535 groups in a dimension | F01 | — | TO-DO |
-| [F12](tickets/F12-ray-tracing-builder-wave64.md) | The ray-tracing builder's last refused programs on 32-lane waves | F01 | — | TO-DO |
-| [F13](tickets/F13-pooled-gpu-allocations.md) | GPU allocations sub-allocated from pooled heaps | F07 | — | TO-DO |
-| [F14](tickets/F14-allocator-contention.md) | The process heap's lock (allocator contention) | user | — | TO-DO |
+| [F12](tickets/F12-ray-tracing-builder-wave64.md) | The ray-tracing builder's last refused programs on 32-lane waves | F01 | — | DONE |
+| [F13](tickets/F13-pooled-gpu-allocations.md) | GPU allocations sub-allocated from pooled heaps | F07 | — | IN PROGRESS |
+| [F14](tickets/F14-allocator-contention.md) | The process heap's lock (allocator contention) | user | — | IN PROGRESS |
 | [F15](tickets/F15-intro-video-regression.md) | The intro video flickers and zooms (regression) | — | — | DONE |
+| [F16](tickets/F16-builder-memory-coverage.md) | The builder sees all the title memory it reads (ray-traced lighting) | F12, F08 | — | TO-DO |

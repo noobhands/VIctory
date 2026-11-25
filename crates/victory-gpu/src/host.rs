@@ -5468,6 +5468,11 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    #[cfg(feature = "diagnostics")]
+    if crate::storetrace::on() && len > 0 {
+        // SAFETY: the caller's source holds `len` bytes.
+        crate::storetrace::wrote(dst as usize, unsafe { std::slice::from_raw_parts(src, len) });
+    }
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;

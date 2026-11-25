@@ -56,7 +56,23 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
+/// `VICTORY_MEMORY_COPIES` overrides it (at most 65,535): the builder's
+/// walk of the world's geometry names thousands of title buffers, each a
+/// copy of its own, and ran out of numbers within seconds (its pages then
+/// read zeros).
 const COPIES: u32 = 1023;
+
+/// [`COPIES`], or `VICTORY_MEMORY_COPIES` if set to a number from 1 to
+/// 65,535.
+fn copies_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| copies_from(std::env::var("VICTORY_MEMORY_COPIES").ok().as_deref()))
+}
+
+/// The copy limit `VICTORY_MEMORY_COPIES` = `v` asks for ([`copies_limit`]).
+fn copies_from(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (1..=65_535).contains(n)).unwrap_or(COPIES)
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -82,6 +98,43 @@ struct Memory {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// Pages a shader asked for that got no copy, by why (diagnostics, with
+/// `VICTORY_STORE_TRACE`): past the directory, refused earlier this frame,
+/// not committed, no copy holds the page whole, the copy cannot be
+/// written by shaders, no number left.
+static UNMAPPED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// With `VICTORY_STORE_TRACE`, for the first 3,000 pages refused as not
+/// committed: what the kernel says of the page (state, protection, type,
+/// the allocation's base and the run's size), to tell a pointer into
+/// nothing from memory the title reserved and has not committed.
+#[cfg(feature = "diagnostics")]
+fn query_note(start: u64) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !crate::storetrace::on() || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3000 {
+        return;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    crate::storetrace::note(&format!(
+        "Q {start:#x} answered {} state {:#x} protect {:#x} type {:#x} base {:#x} run {:#x}",
+        n != 0,
+        info.State,
+        info.Protect,
+        info.Type,
+        info.AllocationBase as usize,
+        info.RegionSize
+    ));
+}
+
+/// Counts a page left without a copy for reason `why` ([`UNMAPPED`]).
+fn unmapped(why: usize) {
+    UNMAPPED[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -120,6 +173,7 @@ impl Memory {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
+            unmapped(0);
             return;
         }
         // SAFETY: inside the directory's mapping.
@@ -132,10 +186,14 @@ impl Memory {
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
+            unmapped(1);
             return;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
+            unmapped(2);
+            #[cfg(feature = "diagnostics")]
+            query_note(start);
             return;
         }
         // The copy a root view at that address would get; a buffer that
@@ -145,16 +203,18 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
+            unmapped(3);
             return;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            unmapped(4);
             return;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies_limit() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -180,8 +240,9 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(copies = copies_limit(), "title memory by address: no number left for another copy; its pages read zeros")
                 });
+                unmapped(5);
                 return;
             }
         };
@@ -208,6 +269,15 @@ impl Memory {
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::storetrace::on() && !pages.is_empty() {
+            let mut sorted = pages.clone();
+            sorted.sort_unstable();
+            let list: Vec<String> = sorted.iter().map(|&p| format!("{:#x}", u64::from(p) * PAGE)).collect();
+            let why: Vec<u64> = UNMAPPED.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+            crate::storetrace::note(&format!("U {why:?} (past the directory, refused this frame, not committed, no copy, copy without unordered access, no number)"));
+            crate::storetrace::note(&format!("F {} {}", sorted.len(), list.join(",")));
         }
         if !pages.is_empty() {
             // Each is an access that read 0 or was dropped.
@@ -280,7 +350,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies_limit() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }
@@ -316,4 +386,17 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `VICTORY_MEMORY_COPIES`: a number from 1 to 65,535, else the default.
+    #[test]
+    fn the_copy_limit_takes_a_number_in_range() {
+        assert_eq!(super::copies_from(None), super::COPIES);
+        assert_eq!(super::copies_from(Some(" 8191 ")), 8191);
+        assert_eq!(super::copies_from(Some("0")), super::COPIES);
+        assert_eq!(super::copies_from(Some("70000")), super::COPIES);
+        assert_eq!(super::copies_from(Some("many")), super::COPIES);
+    }
 }

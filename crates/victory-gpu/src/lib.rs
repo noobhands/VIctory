@@ -53,6 +53,8 @@ mod recycle;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod storetrace;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

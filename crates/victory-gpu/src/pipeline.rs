@@ -287,10 +287,38 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// shortcut: not a way to run: the title also reads results back (sizes,
 /// counters) and gets none, and a copy's pages are overwritten from title
 /// memory when the title writes them.
+///
+/// `VICTORY_BVH_BACK=<prefixes>` (comma-separated hex prefixes of shader
+/// hashes): only the builder stages whose hash starts with one of them
+/// copy their stores back; the others stay quarantined. To find, by
+/// halving, the stage whose stores break the title.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    static BACK: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    if !is_builder(this) {
+        return false;
+    }
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    let back = BACK.get_or_init(|| std::env::var("VICTORY_BVH_BACK").ok().map(|v| back_prefixes(&v)));
+    match back {
+        Some(prefixes) => !pipeline(this).shaders.iter().any(|s| back_allowed(&s.hash, prefixes)),
+        None => false,
+    }
+}
+
+/// The prefixes `VICTORY_BVH_BACK` lists: trimmed, lower case, empty ones
+/// left out.
+fn back_prefixes(v: &str) -> Vec<String> {
+    v.split(',').map(|p| p.trim().to_ascii_lowercase()).filter(|p| !p.is_empty()).collect()
+}
+
+/// Whether a builder stage whose shader hash is `hash` copies its stores
+/// back under `VICTORY_BVH_BACK` = `prefixes`.
+fn back_allowed(hash: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| hash.starts_with(p.as_str()))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -754,6 +782,19 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_BVH_BACK`: a stage copies back when its hash starts with a
+    /// listed prefix, in any case; an empty list lets none.
+    #[test]
+    fn builder_stages_copy_back_by_hash_prefix() {
+        let p = super::back_prefixes(" 0, 1A ,,c85");
+        assert_eq!(p, ["0", "1a", "c85"]);
+        assert!(super::back_allowed("0123456789abcdef", &p));
+        assert!(super::back_allowed("1a00000000000000", &p));
+        assert!(super::back_allowed("c85822de2e41cfaa", &p));
+        assert!(!super::back_allowed("c86822de2e41cfaa", &p));
+        assert!(!super::back_allowed("0123456789abcdef", &super::back_prefixes("")));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
